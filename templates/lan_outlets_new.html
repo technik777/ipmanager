@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}LAN-Dose anlegen{% endblock title %}
+{% block content %}
+<h1>LAN-Dose anlegen</h1>
+
+{% if error %}
+<p style="color:red;">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/lan-outlets">
+  <label>
+    Standort<br />
+    <select name="location_id" required>
+      <option value="" selected>Bitte wählen…</option>
+      {% for l in locations %}
+        <option value="{{ l.id }}">{{ l.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <br /><br />
+
+  <label>
+    Label (z. B. D-1.23-A)<br />
+    <input name="label" required />
+  </label>
+  <br /><br />
+
+  <label>
+    Beschreibung (optional)<br />
+    <input name="description" />
+  </label>
+  <br /><br />
+
+  <button type="submit">Speichern</button>
+</form>
+{% endblock content %}

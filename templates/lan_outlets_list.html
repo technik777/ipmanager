@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}LAN-Dosen{% endblock title %}
+{% block content %}
+<h1>LAN-Dosen</h1>
+
+<p><a href="/lan-outlets/new">Neue LAN-Dose anlegen</a></p>
+
+{% if lan_outlets | length == 0 %}
+  <p>Keine LAN-Dosen vorhanden.</p>
+{% else %}
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>Standort</th>
+        <th>Label</th>
+        <th>Beschreibung</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for o in lan_outlets %}
+      <tr>
+        <td>{{ o.location_name }}</td>
+        <td>{{ o.label }}</td>
+        <td>{{ o.description | default(value="") }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock content %}

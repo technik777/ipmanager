@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Kea DHCPv4 Konfiguration{% endblock title %}
+
+{% block content %}
+<h1>Kea DHCPv4 Konfiguration</h1>
+
+<p>Preview der generierten <code>kea-dhcp4</code>-Konfiguration (JSON) aus der Datenbank.</p>
+
+{% if error %}
+<p style="color: red;">{{ error }}</p>
+{% endif %}
+
+{% if outcome %}
+<h2>Letztes Deploy</h2>
+<ul>
+  <li><strong>Datei:</strong> {{ outcome.written_to }}</li>
+  <li><strong>Reload versucht:</strong> {{ outcome.reload_attempted }}</li>
+  <li><strong>Reload Status:</strong> {{ outcome.reload_status }}</li>
+</ul>
+
+{% if outcome.reload_message %}
+<h3>Reload Antwort</h3>
+<pre>{{ outcome.reload_message }}</pre>
+{% endif %}
+{% endif %}
+
+<form method="post" action="/dhcp/kea/deploy">
+  <button type="submit">Deploy</button>
+</form>
+
+<h2>Preview</h2>
+<pre style="white-space: pre-wrap;">{{ kea_json }}</pre>
+{% endblock content %}

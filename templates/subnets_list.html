@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Subnets{% endblock title %}
+{% block content %}
+<h1>Subnets</h1>
+
+<p><a href="/subnets/new">Neues Subnet anlegen</a></p>
+
+{% if subnets | length == 0 %}
+  <p>Keine Subnets vorhanden.</p>
+{% else %}
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>CIDR</th>
+        <th>DNS Zone</th>
+        <th>Reverse Zone</th>
+        <th>DHCP</th>
+        <th>PXE</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in subnets %}
+      <tr>
+        <td>{{ s.name }}</td>
+        <td>{{ s.cidr }}</td>
+        <td>{{ s.dns_zone | default(value="") }}</td>
+        <td>{{ s.reverse_zone | default(value="") }}</td>
+        <td>{% if s.dhcp_enabled %}ja{% else %}nein{% endif %}</td>
+        <td>{% if s.pxe_enabled %}ja{% else %}nein{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock content %}

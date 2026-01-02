@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+{% block title %}Host bearbeiten{% endblock title %}
+{% block content %}
+<h1>Host bearbeiten</h1>
+
+<p>
+  <a href="/hosts/{{ host.id }}">← Details</a>
+  | <a href="/hosts">Zur Liste</a>
+</p>
+
+{% if error %}
+<p style="color: red;">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/hosts/{{ host.id }}">
+  <label>
+    Hostname<br />
+    <input name="hostname" required value="{{ host.hostname }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    IP (IPv4/IPv6)<br />
+    <input name="ip" required value="{{ host.ip }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    MAC (wird normalisiert)<br />
+    <input name="mac" required value="{{ host.mac }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    Standort<br />
+    <select id="location_id" name="location_id" required>
+      <option value="">Bitte wählen…</option>
+      {% for l in locations %}
+        <option value="{{ l.id }}" {% if l.id == host.location_id %}selected{% endif %}>
+          {{ l.name }}
+        </option>
+      {% endfor %}
+    </select>
+  </label>
+  <br /><br />
+
+  <label>
+    LAN-Dose<br />
+    <select id="lan_outlet_id" name="lan_outlet_id" required disabled>
+      <option value="" selected>Lade…</option>
+    </select>
+  </label>
+  <br /><br />
+
+  <label>
+    Subnet<br />
+    <select name="subnet_id" required>
+      <option value="">Bitte wählen…</option>
+      {% for s in subnets %}
+        <option value="{{ s.id }}" {% if s.id == host.subnet_id %}selected{% endif %}>
+          {{ s.name }} ({{ s.cidr }})
+        </option>
+      {% endfor %}
+    </select>
+  </label>
+  <br /><br />
+
+  <label>
+    PXE enabled
+    <input type="checkbox" name="pxe_enabled" value="true" {% if host.pxe_enabled %}checked{% endif %} />
+  </label>
+  <br /><br />
+
+  <button type="submit">Speichern</button>
+</form>
+
+<script>
+(function () {
+  const locationSel = document.getElementById("location_id");
+  const outletSel = document.getElementById("lan_outlet_id");
+
+  const initialLocationId = "{{ host.location_id }}";
+  const initialOutletId = "{{ host.lan_outlet_id }}";
+
+  function setOutletPlaceholder(text) {
+    outletSel.innerHTML = "";
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = text;
+    opt.selected = true;
+    outletSel.appendChild(opt);
+  }
+
+  async function loadOutlets(locationId, selectedOutletId) {
+    outletSel.disabled = true;
+    setOutletPlaceholder("Lade LAN-Dosen…");
+
+    try {
+      const res = await fetch(`/api/lan-outlets?location_id=${encodeURIComponent(locationId)}`, {
+        headers: { "Accept": "application/json" }
+      });
+
+      if (!res.ok) {
+        setOutletPlaceholder("Fehler beim Laden");
+        return;
+      }
+
+      const items = await res.json();
+
+      outletSel.innerHTML = "";
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "Bitte wählen…";
+      outletSel.appendChild(empty);
+
+      let foundSelected = false;
+      for (const it of items) {
+        const opt = document.createElement("option");
+        opt.value = it.id;
+        opt.textContent = it.label;
+        if (selectedOutletId && selectedOutletId === it.id) {
+          opt.selected = true;
+          foundSelected = true;
+        }
+        outletSel.appendChild(opt);
+      }
+
+      outletSel.disabled = false;
+
+      if (items.length === 0) {
+        setOutletPlaceholder("Keine LAN-Dosen für Standort");
+        outletSel.disabled = true;
+      } else if (selectedOutletId && !foundSelected) {
+        // Falls Host eine Dose hat, die nicht zum Standort passt (Dateninkonsistenz),
+        // zwingen wir bewusst zur Neuauswahl.
+        outletSel.value = "";
+      }
+    } catch (e) {
+      setOutletPlaceholder("Fehler beim Laden");
+    }
+  }
+
+  locationSel.addEventListener("change", () => {
+    const loc = locationSel.value;
+    if (!loc) {
+      outletSel.disabled = true;
+      setOutletPlaceholder("Bitte zuerst Standort wählen…");
+      return;
+    }
+    loadOutlets(loc, null);
+  });
+
+  // Initial load (edit mode)
+  if (initialLocationId && initialLocationId.length > 0) {
+    loadOutlets(initialLocationId, initialOutletId);
+  } else {
+    outletSel.disabled = true;
+    setOutletPlaceholder("Bitte zuerst Standort wählen…");
+  }
+})();
+</script>
+
+{% endblock content %}

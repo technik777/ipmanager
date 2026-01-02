@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}ipmanager{% endblock title %}</title>
+  </head>
+  <body>
+    <header>
+      <nav style="display:flex; gap: 12px; align-items:center;">
+        <a href="/">ipmanager</a>
+        <a href="/hosts">Hosts</a>
+        <a href="/locations">Standorte</a>
+        <a href="/lan-outlets">LAN-Dosen</a>
+        <a href="/subnets">Subnets</a>
+        <a href="/me">Me</a>
+
+        {% if is_authenticated %}
+          <form method="post" action="/logout" style="display:inline;">
+            <button type="submit">Logout</button>
+          </form>
+        {% else %}
+          <a href="/login">Login</a>
+        {% endif %}
+      </nav>
+      <hr />
+    </header>
+
+    <main>
+      {% block content %}{% endblock content %}
+    </main>
+  </body>
+</html>

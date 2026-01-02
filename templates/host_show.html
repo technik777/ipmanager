@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Host{% endblock title %}
+{% block content %}
+<h1>Host</h1>
+
+<p>
+  <a href="/hosts">← Zurück</a>
+  | <a href="/hosts/{{ host.id }}/edit">Bearbeiten</a>
+</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+  <tr><th>ID</th><td>{{ host.id }}</td></tr>
+  <tr><th>Hostname</th><td>{{ host.hostname }}</td></tr>
+  <tr><th>IP</th><td>{{ host.ip }}</td></tr>
+  <tr><th>MAC</th><td>{{ host.mac }}</td></tr>
+  <tr><th>Standort</th><td>{{ host.location_name | default(value="") }}</td></tr>
+  <tr><th>LAN-Dose</th><td>{{ host.lan_outlet_label | default(value="") }}</td></tr>
+  <tr><th>Subnet</th><td>{{ host.subnet_display | default(value="") }}</td></tr>
+  <tr><th>PXE</th><td>{% if host.pxe_enabled %}ja{% else %}nein{% endif %}</td></tr>
+</table>
+{% endblock content %}

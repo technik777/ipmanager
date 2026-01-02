@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Hosts{% endblock title %}
+{% block content %}
+<h1>Hosts</h1>
+
+<p><a href="/hosts/new">Neuen Host anlegen</a></p>
+
+<form method="get" action="/hosts" style="margin: 12px 0;">
+  <label>
+    Suche (Hostname, IP, MAC, Standort, LAN-Dose):
+    <input name="q" value="{{ q | default(value="") }}" />
+  </label>
+  <button type="submit">Suchen</button>
+  {% if q and q | length > 0 %}
+    <a href="/hosts" style="margin-left: 10px;">Zurücksetzen</a>
+  {% endif %}
+</form>
+
+{% if hosts | length == 0 %}
+  <p>Keine Hosts gefunden.</p>
+{% else %}
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>Hostname</th>
+        <th>IP</th>
+        <th>MAC</th>
+        <th>Standort</th>
+        <th>LAN-Dose</th>
+        <th>PXE</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for h in hosts %}
+      <tr>
+        <td><a href="/hosts/{{ h.id }}">{{ h.hostname }}</a></td>
+        <td>{{ h.ip }}</td>
+        <td>{{ h.mac }}</td>
+        <td>{{ h.location_name | default(value="") }}</td>
+        <td>{{ h.lan_outlet_label | default(value="") }}</td>
+        <td>{% if h.pxe_enabled %}ja{% else %}nein{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock content %}

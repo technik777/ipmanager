@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Standort anlegen{% endblock title %}
+{% block content %}
+<h1>Standort anlegen</h1>
+
+{% if error %}
+<p style="color:red;">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/locations">
+  <label>
+    Name<br />
+    <input name="name" required />
+  </label>
+  <br /><br />
+  <button type="submit">Speichern</button>
+</form>
+{% endblock content %}

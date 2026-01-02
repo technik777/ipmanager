@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Standorte{% endblock title %}
+{% block content %}
+<h1>Standorte</h1>
+
+<p><a href="/locations/new">Neuen Standort anlegen</a></p>
+
+{% if locations | length == 0 %}
+  <p>Keine Standorte vorhanden.</p>
+{% else %}
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>Name</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for l in locations %}
+      <tr>
+        <td>{{ l.name }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock content %}
