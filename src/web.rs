@@ -497,7 +497,7 @@ async fn hosts_list(
         match sqlx::query_as(
             "select h.id,
                         h.hostname,
-                        h.ip::text,
+                        host(h.ip),
                         h.mac,
                         l.name as location_name,
                         o.label as lan_outlet_label,
@@ -713,7 +713,7 @@ async fn host_show(
     )> = match sqlx::query_as(
         "select h.id,
                 h.hostname,
-                h.ip::text,
+                host(h.ip),
                 h.mac,
                 h.location_id,
                 h.lan_outlet_id,
@@ -962,7 +962,7 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
     )> = sqlx::query_as(
         "select h.id,
                 h.hostname,
-                h.ip::text,
+                host(h.ip),
                 h.mac,
                 h.location_id,
                 h.lan_outlet_id,
