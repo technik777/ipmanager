@@ -33,7 +33,9 @@
         <td>{{ s.dhcp_pool_start | default(value="") }}</td>
         <td>{{ s.dhcp_pool_end | default(value="") }}</td>
         <td>{% if s.pxe_enabled %}ja{% else %}nein{% endif %}</td>
-        <td><a href="/subnets/{{ s.id }}/edit">Edit</a></td>
+        <td>
+          <a href="/subnets/{{ s.id }}/edit">Bearbeiten</a>
+        </td>
       </tr>
       {% endfor %}
     </tbody>
