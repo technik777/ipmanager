@@ -222,6 +222,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/lan-outlets/new", get(lan_outlets_new))
         .route("/subnets", get(subnets_list).post(subnets_create))
+        .route("/subnets/", get(|| async { Redirect::to("/subnets") }))
         .route("/subnets/new", get(subnets_new))
         .route("/subnets/{id}/edit", get(subnets_edit))
         .route("/subnets/{id}", post(subnets_update))
