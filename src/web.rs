@@ -106,6 +106,31 @@ pub struct SubnetCreateForm {
     pub dhcp_pool_end: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct SubnetUpdateForm {
+    pub name: String,
+    pub cidr: String,
+    pub dns_zone: Option<String>,
+    pub reverse_zone: Option<String>,
+    pub dhcp_enabled: Option<String>,
+    pub pxe_enabled: Option<String>,
+    pub dhcp_pool_start: Option<String>,
+    pub dhcp_pool_end: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SubnetEdit {
+    id: String,
+    name: String,
+    cidr: String,
+    dns_zone: Option<String>,
+    reverse_zone: Option<String>,
+    dhcp_enabled: bool,
+    dhcp_pool_start: Option<String>,
+    dhcp_pool_end: Option<String>,
+    pxe_enabled: bool,
+}
+
 #[derive(Serialize)]
 struct HostRow {
     id: String,
@@ -167,11 +192,14 @@ struct SubnetOption {
 
 #[derive(Serialize)]
 struct SubnetRow {
+    id: String,
     name: String,
     cidr: String,
     dns_zone: Option<String>,
     reverse_zone: Option<String>,
     dhcp_enabled: bool,
+    dhcp_pool_start: Option<String>,
+    dhcp_pool_end: Option<String>,
     pxe_enabled: bool,
 }
 
@@ -195,6 +223,8 @@ pub fn router(state: AppState) -> Router {
         .route("/lan-outlets/new", get(lan_outlets_new))
         .route("/subnets", get(subnets_list).post(subnets_create))
         .route("/subnets/new", get(subnets_new))
+        .route("/subnets/{id}/edit", get(subnets_edit))
+        .route("/subnets/{id}", post(subnets_update))
         // Kea DHCP
         .route("/dhcp/kea", get(dhcp_kea_page))
         .route("/dhcp/kea/deploy", post(dhcp_kea_deploy))
@@ -1225,33 +1255,58 @@ async fn subnets_list(State(state): State<AppState>, session: Session) -> Respon
         return resp;
     }
 
-    let rows: Vec<(String, String, Option<String>, Option<String>, bool, bool)> =
-        match sqlx::query_as(
-            "select name,
-                    cidr::text,
-                    dns_zone,
-                    reverse_zone,
-                    dhcp_enabled,
-                    pxe_enabled
-             from subnets
-             order by name asc",
-        )
-        .fetch_all(&state.pool)
-        .await
-        {
-            Ok(v) => v,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+    let rows: Vec<(
+        Uuid,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+        Option<String>,
+        Option<String>,
+        bool,
+    )> = match sqlx::query_as(
+        "select id,
+                name,
+                cidr::text,
+                dns_zone,
+                reverse_zone,
+                dhcp_enabled,
+                host(dhcp_pool_start),
+                host(dhcp_pool_end),
+                pxe_enabled
+         from subnets
+         order by name asc",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
     let subnets: Vec<SubnetRow> = rows
         .into_iter()
         .map(
-            |(name, cidr, dns_zone, reverse_zone, dhcp_enabled, pxe_enabled)| SubnetRow {
+            |(
+                id,
                 name,
                 cidr,
                 dns_zone,
                 reverse_zone,
                 dhcp_enabled,
+                dhcp_pool_start,
+                dhcp_pool_end,
+                pxe_enabled,
+            )| SubnetRow {
+                id: id.to_string(),
+                name,
+                cidr,
+                dns_zone,
+                reverse_zone,
+                dhcp_enabled,
+                dhcp_pool_start,
+                dhcp_pool_end,
                 pxe_enabled,
             },
         )
@@ -1359,6 +1414,222 @@ async fn subnets_create(
             render_subnets_new_error(&state, &session, msg).await
         }
     }
+}
+
+async fn subnets_edit(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+
+    let row: Option<(
+        Uuid,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+        Option<String>,
+        Option<String>,
+        bool,
+    )> = match sqlx::query_as(
+        "select id,
+                name,
+                cidr::text,
+                dns_zone,
+                reverse_zone,
+                dhcp_enabled,
+                host(dhcp_pool_start),
+                host(dhcp_pool_end),
+                pxe_enabled
+         from subnets
+         where id = $1
+         limit 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let Some((
+        sid,
+        name,
+        cidr,
+        dns_zone,
+        reverse_zone,
+        dhcp_enabled,
+        dhcp_pool_start,
+        dhcp_pool_end,
+        pxe_enabled,
+    )) = row else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let subnet = SubnetEdit {
+        id: sid.to_string(),
+        name,
+        cidr,
+        dns_zone,
+        reverse_zone,
+        dhcp_enabled,
+        dhcp_pool_start,
+        dhcp_pool_end,
+        pxe_enabled,
+    };
+
+    let mut ctx = Context::new();
+    add_auth_context(&mut ctx, &session).await;
+    ctx.insert("error", &Option::<String>::None);
+    ctx.insert("subnet", &subnet);
+    render(&state.templates, "subnets_edit.html", ctx)
+}
+
+async fn subnets_update(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Form(form): Form<SubnetUpdateForm>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+
+    let name = form.name.trim().to_string();
+    if name.is_empty() {
+        return render_subnets_edit_error(&state, &session, id, &form, "Name darf nicht leer sein").await;
+    }
+
+    let cidr_raw = form.cidr.trim();
+    let cidr: IpNet = match cidr_raw.parse() {
+        Ok(v) => v,
+        Err(_) => return render_subnets_edit_error(&state, &session, id, &form, "Ungültiges CIDR").await,
+    };
+
+    let dns_zone = form
+        .dns_zone
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let reverse_zone = form
+        .reverse_zone
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let dhcp_enabled = form.dhcp_enabled.is_some();
+    let pxe_enabled = form.pxe_enabled.is_some();
+
+    let dhcp_pool_start = form
+        .dhcp_pool_start
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let dhcp_pool_end = form
+        .dhcp_pool_end
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let res = sqlx::query(
+        "update subnets
+         set name = $1,
+             cidr = $2,
+             dns_zone = $3,
+             reverse_zone = $4,
+             dhcp_enabled = $5,
+             pxe_enabled = $6,
+             dhcp_pool_start = $7::inet,
+             dhcp_pool_end = $8::inet
+         where id = $9",
+    )
+    .bind(&name)
+    .bind(cidr.to_string())
+    .bind(&dns_zone)
+    .bind(&reverse_zone)
+    .bind(dhcp_enabled)
+    .bind(pxe_enabled)
+    .bind(&dhcp_pool_start)
+    .bind(&dhcp_pool_end)
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+
+    match res {
+        Ok(r) => {
+            if r.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                Redirect::to("/subnets").into_response()
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "subnet update failed");
+
+            let msg = if let Some(db_err) = e.as_database_error() {
+                let code = db_err.code().map(|c| c.to_string()).unwrap_or_default();
+                match code.as_str() {
+                    "23505" => "Subnet existiert bereits (Name/CIDR)",
+                    "23514" => "Ungültige DHCP-Pool Range: Start und Ende müssen beide gesetzt sein oder beide leer sein.",
+                    "22P02" => "Ungültige IP-Adresse in DHCP Pool Start/Ende.",
+                    _ => "Datenbankfehler beim Speichern",
+                }
+            } else {
+                "Datenbankfehler beim Speichern"
+            };
+
+            render_subnets_edit_error(&state, &session, id, &form, msg).await
+        }
+    }
+}
+
+async fn render_subnets_edit_error(
+    state: &AppState,
+    session: &Session,
+    id: Uuid,
+    form: &SubnetUpdateForm,
+    msg: &str,
+) -> Response {
+    let subnet = SubnetEdit {
+        id: id.to_string(),
+        name: form.name.trim().to_string(),
+        cidr: form.cidr.trim().to_string(),
+        dns_zone: form
+            .dns_zone
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        reverse_zone: form
+            .reverse_zone
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        dhcp_enabled: form.dhcp_enabled.is_some(),
+        dhcp_pool_start: form
+            .dhcp_pool_start
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        dhcp_pool_end: form
+            .dhcp_pool_end
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        pxe_enabled: form.pxe_enabled.is_some(),
+    };
+
+    let mut ctx = Context::new();
+    add_auth_context(&mut ctx, session).await;
+    ctx.insert("error", &Some(msg.to_string()));
+    ctx.insert("subnet", &subnet);
+    render(&state.templates, "subnets_edit.html", ctx)
 }
 
 async fn render_subnets_new_error(state: &AppState, session: &Session, msg: &str) -> Response {
