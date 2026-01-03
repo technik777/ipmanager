@@ -1467,7 +1467,8 @@ async fn subnets_edit(
         dhcp_pool_start,
         dhcp_pool_end,
         pxe_enabled,
-    )) = row else {
+    )) = row
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -1502,13 +1503,16 @@ async fn subnets_update(
 
     let name = form.name.trim().to_string();
     if name.is_empty() {
-        return render_subnets_edit_error(&state, &session, id, &form, "Name darf nicht leer sein").await;
+        return render_subnets_edit_error(&state, &session, id, &form, "Name darf nicht leer sein")
+            .await;
     }
 
     let cidr_raw = form.cidr.trim();
     let cidr: IpNet = match cidr_raw.parse() {
         Ok(v) => v,
-        Err(_) => return render_subnets_edit_error(&state, &session, id, &form, "Ungültiges CIDR").await,
+        Err(_) => {
+            return render_subnets_edit_error(&state, &session, id, &form, "Ungültiges CIDR").await
+        }
     };
 
     let dns_zone = form
