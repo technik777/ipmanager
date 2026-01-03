@@ -10,37 +10,37 @@
 <form method="post" action="/subnets/{{ subnet.id }}">
   <label>
     Name<br />
-    <input name="name" required value="{{ subnet.name }}" />
+    <input name="name" value="{{ subnet.name }}" required />
   </label>
   <br /><br />
 
   <label>
     CIDR (z. B. 192.168.174.0/24)<br />
-    <input name="cidr" required value="{{ subnet.cidr }}" />
+    <input name="cidr" value="{{ subnet.cidr }}" required />
   </label>
   <br /><br />
 
   <label>
     DNS Zone (optional)<br />
-    <input name="dns_zone" value="{{ subnet.dns_zone | default(value='') }}" />
+    <input name="dns_zone" value="{{ subnet.dns_zone | default(value="") }}" />
   </label>
   <br /><br />
 
   <label>
     Reverse Zone (optional)<br />
-    <input name="reverse_zone" value="{{ subnet.reverse_zone | default(value='') }}" />
+    <input name="reverse_zone" value="{{ subnet.reverse_zone | default(value="") }}" />
   </label>
   <br /><br />
 
   <label>
     DHCP Pool Start (optional, IPv4)<br />
-    <input name="dhcp_pool_start" placeholder="z. B. 192.168.174.50" value="{{ subnet.dhcp_pool_start | default(value='') }}" />
+    <input name="dhcp_pool_start" placeholder="z. B. 192.168.174.50" value="{{ subnet.dhcp_pool_start | default(value="") }}" />
   </label>
   <br /><br />
 
   <label>
     DHCP Pool End (optional, IPv4)<br />
-    <input name="dhcp_pool_end" placeholder="z. B. 192.168.174.200" value="{{ subnet.dhcp_pool_end | default(value='') }}" />
+    <input name="dhcp_pool_end" placeholder="z. B. 192.168.174.200" value="{{ subnet.dhcp_pool_end | default(value="") }}" />
   </label>
   <br /><br />
 
@@ -57,6 +57,7 @@
   <br /><br />
 
   <button type="submit">Speichern</button>
-  <a href="/subnets" style="margin-left: 12px;">Abbrechen</a>
+  &nbsp;
+  <a href="/subnets">Abbrechen</a>
 </form>
 {% endblock content %}
