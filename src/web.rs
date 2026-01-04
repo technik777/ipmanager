@@ -1388,7 +1388,6 @@ async fn subnets_create(
         .await;
     }
 
-
     let res = sqlx::query(
         "insert into subnets (name, cidr, dns_zone, reverse_zone, dhcp_enabled, pxe_enabled, dhcp_pool_start, dhcp_pool_end)
          values ($1, $2, $3, $4, $5, $6, $7::inet, $8::inet)",
