@@ -11,15 +11,29 @@
 {% endif %}
 
 {% if outcome %}
-<h2>Letztes Deploy</h2>
+<h2>Deploy Ergebnis</h2>
 <ul>
   <li><strong>Datei:</strong> {{ outcome.written_to }}</li>
-  <li><strong>Reload versucht:</strong> {{ outcome.reload_attempted }}</li>
-  <li><strong>Reload Status:</strong> {{ outcome.reload_status }}</li>
+  <li><strong>Reload:</strong>
+    {% if outcome.reload_attempted %}
+      versucht
+    {% else %}
+      nicht versucht
+    {% endif %}
+  </li>
+  <li><strong>Reload Status:</strong>
+    {% if outcome.reload_status == "ok" %}
+      ok
+    {% elif outcome.reload_status == "failed" %}
+      fehlgeschlagen
+    {% else %}
+      nicht ausgeführt
+    {% endif %}
+  </li>
 </ul>
 
 {% if outcome.reload_message %}
-<h3>Reload Antwort</h3>
+<h3>Reload Ausgabe</h3>
 <pre>{{ outcome.reload_message }}</pre>
 {% endif %}
 {% endif %}
