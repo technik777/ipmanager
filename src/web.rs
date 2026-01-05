@@ -2,25 +2,27 @@ use axum::{
     extract::{Form, Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, get_service, post},
     Json, Router,
 };
 use ipnetwork::IpNetwork;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::{net::Ipv4Addr, str::FromStr, sync::Arc};
+use std::{net::Ipv4Addr, path::Path as StdPath, str::FromStr, sync::Arc};
 use tera::{Context, Tera};
 use tower_sessions::Session;
 use uuid::Uuid;
 
 use crate::domain::mac::MacAddr;
 use crate::{config::Config, dhcp_kea};
+use tower_http::services::ServeDir;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub templates: Arc<Tera>,
+    pub config: crate::config::Config,
 }
 
 /* ----------------------------- API (JSON) ----------------------------- */
@@ -204,8 +206,44 @@ struct SubnetRow {
     pxe_enabled: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct PxeImage {
+    id: i64,
+    name: String,
+    kind: String,
+    arch: String,
+    kernel_path: Option<String>,
+    initrd_path: Option<String>,
+    chain_url: Option<String>,
+    cmdline: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct PxeImageForm {
+    name: String,
+    kind: String,
+    arch: String,
+    kernel_path: Option<String>,
+    initrd_path: Option<String>,
+    chain_url: Option<String>,
+    cmdline: Option<String>,
+    enabled: Option<String>,
+}
+
+struct ValidatedPxe {
+    name: String,
+    kind: String,
+    arch: String,
+    kernel_path: Option<String>,
+    initrd_path: Option<String>,
+    chain_url: Option<String>,
+    cmdline: Option<String>,
+    enabled: bool,
+}
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         // SSR
         .route("/", get(index))
         .route("/login", get(login_page).post(login_submit))
@@ -230,11 +268,26 @@ pub fn router(state: AppState) -> Router {
         // Kea DHCP
         .route("/dhcp/kea", get(dhcp_kea_page))
         .route("/dhcp/kea/deploy", post(dhcp_kea_deploy))
+        // PXE / iPXE
+        .route("/boot.ipxe", get(boot_ipxe))
         // API
         .route("/api/login", post(api_login))
         .route("/api/me", get(api_me))
-        .route("/api/lan-outlets", get(api_lan_outlets_by_location))
-        .with_state(state)
+        .route("/api/lan-outlets", get(api_lan_outlets_by_location));
+
+    if state.config.pxe_enabled {
+        router = router
+            .route("/pxe/images", get(pxe_images_list))
+            .route("/pxe/images/new", get(pxe_images_new).post(pxe_images_create))
+            .route("/pxe/images/{id}/edit", get(pxe_images_edit).post(pxe_images_update))
+            .route("/pxe/images/{id}/delete", post(pxe_images_delete));
+        router = router.route_service(
+            "/pxe-assets/*path",
+            get_service(ServeDir::new(state.config.pxe_root_dir.clone())),
+        );
+    }
+
+    router.with_state(state)
 }
 
 /* ----------------------------- Auth helpers ----------------------------- */
@@ -255,6 +308,82 @@ fn validate_ipv4(ip: &str) -> Result<Ipv4Addr, String> {
 
 fn validate_mac(mac: &str) -> Result<MacAddr, String> {
     MacAddr::from_str(mac.trim()).map_err(|_| "Ungültige MAC-Adresse".to_string())
+}
+
+#[allow(dead_code)]
+fn list_pxe_files(root_dir: &StdPath) -> Vec<String> {
+    let allowed_ext = [
+        "ipxe", "efi", "kpxe", "pxe", "vmlinuz", "img", "gz", "xz", "iso",
+    ];
+
+    let Ok(read_dir) = std::fs::read_dir(root_dir) else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if !allowed_ext.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        if let Ok(rel) = path.strip_prefix(root_dir) {
+            if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                continue;
+            }
+            if let Some(s) = rel.to_str() {
+                files.push(s.replace('\\', "/"));
+            }
+        }
+    }
+
+    files.sort();
+    files
+}
+
+fn sanitize_label(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn sanitize_cmdline(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+fn valid_rel_path(p: &str) -> bool {
+    let path = StdPath::new(p);
+    !p.is_empty()
+        && !path.is_absolute()
+        && !p.starts_with('/')
+        && !path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+fn ensure_path_allowed(root: &StdPath, rel: &str) -> bool {
+    if !valid_rel_path(rel) {
+        return false;
+    }
+    let candidate = root.join(rel);
+    match candidate.canonicalize() {
+        Ok(real) => real.starts_with(root) && real.is_file(),
+        Err(_) => false,
+    }
 }
 
 async fn is_authenticated(session: &Session) -> bool {
@@ -445,7 +574,7 @@ async fn dhcp_kea_page(State(state): State<AppState>, session: Session) -> Respo
         }
     };
 
-    let kea_json = match dhcp_kea::render_dhcp4_config(&state.pool).await {
+    let kea_json = match dhcp_kea::render_dhcp4_config(&state.pool, &cfg).await {
         Ok(j) => j,
         Err(e) => {
             let mut ctx = Context::new();
@@ -488,7 +617,7 @@ async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Res
             add_auth_context(&mut ctx, &session).await;
             ctx.insert("error", &Some(format!("Deploy fehlgeschlagen: {e:#}")));
 
-            let kea_json = dhcp_kea::render_dhcp4_config(&state.pool)
+            let kea_json = dhcp_kea::render_dhcp4_config(&state.pool, &cfg)
                 .await
                 .unwrap_or_else(|_| "{}".to_string());
             ctx.insert("kea_json", &kea_json);
@@ -498,7 +627,7 @@ async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Res
         }
     };
 
-    let kea_json = dhcp_kea::render_dhcp4_config(&state.pool)
+    let kea_json = dhcp_kea::render_dhcp4_config(&state.pool, &cfg)
         .await
         .unwrap_or_else(|_| "{}".to_string());
 
@@ -537,6 +666,8 @@ async fn hosts_list(
         return resp;
     }
 
+    tracing::info!("render hosts_list");
+
     let q_raw = query.q.clone().unwrap_or_default();
     let q = q_raw.trim().to_string();
 
@@ -566,7 +697,10 @@ async fn hosts_list(
         .await
         {
             Ok(v) => v,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(e) => {
+                tracing::error!(error = ?e, "DB error in hosts_list");
+                return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Hosts");
+            }
         }
     } else {
         let like = format!("%{}%", q);
@@ -586,14 +720,17 @@ async fn hosts_list(
                     or h.mac ilike $1
                     or coalesce(l.name, '') ilike $1
                     or coalesce(o.label, '') ilike $1
-                 order by h.hostname asc",
+                order by h.hostname asc",
         )
         .bind(like)
         .fetch_all(&state.pool)
         .await
         {
             Ok(v) => v,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(e) => {
+                tracing::error!(error = ?e, "DB error in hosts_list (search)");
+                return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Hosts");
+            }
         }
     };
 
@@ -625,17 +762,28 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
         return resp;
     }
 
+    tracing::info!("render template hosts_new.html");
+
     let locations = match load_locations(&state.pool).await {
         Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "DB error in hosts_new loading locations");
+            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Standorte");
+        }
     };
     let lan_outlets = match load_lan_outlets(&state.pool).await {
         Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "DB error in hosts_new loading lan_outlets");
+            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der LAN-Dosen");
+        }
     };
     let subnets = match load_subnets(&state.pool).await {
         Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "DB error in hosts_new loading subnets");
+            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Subnets");
+        }
     };
 
     let mut ctx = Context::new();
@@ -644,6 +792,18 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
     ctx.insert("locations", &locations);
     ctx.insert("lan_outlets", &lan_outlets);
     ctx.insert("subnets", &subnets);
+    ctx.insert(
+        "form",
+        &serde_json::json!({
+            "hostname": "",
+            "ip": "",
+            "mac": "",
+            "location_id": "",
+            "lan_outlet_id": "",
+            "subnet_id": "",
+            "pxe_enabled": false
+        }),
+    );
 
     render(&state.templates, "hosts_new.html", ctx)
 }
@@ -659,33 +819,33 @@ async fn hosts_create(
 
     let hostname = form.hostname.trim().to_string();
     if hostname.is_empty() {
-        return render_hosts_new_error(&state, &session, "Hostname darf nicht leer sein").await;
+        return render_hosts_new_error(&state, &session, &form, "Hostname darf nicht leer sein").await;
     }
 
     let ip: Ipv4Addr = match validate_ipv4(form.ip.trim()) {
         Ok(v) => v,
-        Err(msg) => return render_hosts_new_error(&state, &session, &msg).await,
+        Err(msg) => return render_hosts_new_error(&state, &session, &form, &msg).await,
     };
 
     let mac: MacAddr = match validate_mac(form.mac.trim()) {
         Ok(v) => v,
-        Err(msg) => return render_hosts_new_error(&state, &session, &msg).await,
+        Err(msg) => return render_hosts_new_error(&state, &session, &form, &msg).await,
     };
     let mac_norm = mac.to_string();
 
     let location_id: Uuid = match Uuid::parse_str(form.location_id.trim()) {
         Ok(v) => v,
-        Err(_) => return render_hosts_new_error(&state, &session, "Ungültiger Standort").await,
+        Err(_) => return render_hosts_new_error(&state, &session, &form, "Ungültiger Standort").await,
     };
 
     let lan_outlet_id: Uuid = match Uuid::parse_str(form.lan_outlet_id.trim()) {
         Ok(v) => v,
-        Err(_) => return render_hosts_new_error(&state, &session, "Ungültige LAN-Dose").await,
+        Err(_) => return render_hosts_new_error(&state, &session, &form, "Ungültige LAN-Dose").await,
     };
 
     let subnet_id: Uuid = match Uuid::parse_str(form.subnet_id.trim()) {
         Ok(v) => v,
-        Err(_) => return render_hosts_new_error(&state, &session, "Ungültiges Subnet").await,
+        Err(_) => return render_hosts_new_error(&state, &session, &form, "Ungültiges Subnet").await,
     };
 
     // IP muss im gewählten Subnet liegen
@@ -695,17 +855,20 @@ async fn hosts_create(
         .await
     {
         Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "DB error in hosts_create loading subnet by id");
+            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden des Subnets");
+        }
     };
     let Some(cidr) = cidr else {
-        return render_hosts_new_error(&state, &session, "Ungültiges Subnet").await;
+        return render_hosts_new_error(&state, &session, &form, "Ungültiges Subnet").await;
     };
     let net: ipnet::Ipv4Net = match cidr.parse() {
         Ok(n) => n,
-        Err(_) => return render_hosts_new_error(&state, &session, "Subnet CIDR ist ungültig").await,
+        Err(_) => return render_hosts_new_error(&state, &session, &form, "Subnet CIDR ist ungültig").await,
     };
     if !net.contains(&ip) {
-        return render_hosts_new_error(&state, &session, "IP liegt nicht im gewählten Subnet").await;
+        return render_hosts_new_error(&state, &session, &form, "IP liegt nicht im gewählten Subnet").await;
     }
 
     // Vor dem Insert prüfen, ob Hostname/IP/MAC schon existieren
@@ -713,7 +876,7 @@ async fn hosts_create(
         "select hostname, host(ip), mac
          from hosts
          where hostname = $1
-            or ip = $2
+            or ip = $2::inet
             or mac = $3
          limit 1",
     )
@@ -732,13 +895,13 @@ async fn hosts_create(
         } else {
             "Hostname/IP/MAC ist bereits vergeben"
         };
-        return render_hosts_new_error(&state, &session, msg).await;
+        return render_hosts_new_error(&state, &session, &form, msg).await;
     }
 
 
     let pxe_enabled = form.pxe_enabled.is_some();
 
-    let ok_pair: Option<i64> =
+    let ok_pair: Option<i32> =
         match sqlx::query_scalar("select 1 from lan_outlets where id = $1 and location_id = $2")
             .bind(lan_outlet_id)
             .bind(location_id)
@@ -746,21 +909,36 @@ async fn hosts_create(
             .await
         {
             Ok(v) => v,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(e) => {
+                tracing::error!(error = ?e, "DB error checking lan_outlet/location pair");
+                return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Prüfen der LAN-Dose");
+            }
         };
 
     if ok_pair.is_none() {
         return render_hosts_new_error(
             &state,
             &session,
+            &form,
             "LAN-Dose gehört nicht zum gewählten Standort",
         )
         .await;
     }
 
+    tracing::debug!(
+        hostname = %hostname,
+        ip = %ip,
+        mac = %mac_norm,
+        location_id = %location_id,
+        lan_outlet_id = %lan_outlet_id,
+        subnet_id = %subnet_id,
+        pxe_enabled,
+        "Attempting to insert host"
+    );
+
     let res = sqlx::query(
         "insert into hosts (hostname, ip, mac, location_id, lan_outlet_id, subnet_id, pxe_enabled)
-         values ($1, $2, $3, $4, $5, $6, $7)",
+         values ($1, $2::inet, $3, $4, $5, $6, $7)",
     )
     .bind(&hostname)
     .bind(ip.to_string())
@@ -773,8 +951,27 @@ async fn hosts_create(
     .await;
 
     match res {
-        Ok(_) => Redirect::to("/hosts").into_response(),
+        Ok(r) => {
+            tracing::debug!(rows_affected = r.rows_affected(), "Inserted host into database");
+            Redirect::to("/hosts").into_response()
+        }
         Err(e) => {
+            let db_info = e.as_database_error();
+            let code = db_info.and_then(|d| d.code()).map(|c| c.to_string());
+            let constraint = db_info.and_then(|d| d.constraint()).map(str::to_string);
+            tracing::error!(
+                error = %e,
+                code = code.as_deref().unwrap_or("unknown"),
+                constraint = constraint.as_deref().unwrap_or("unknown"),
+                hostname = %hostname,
+                ip = %ip,
+                mac = %mac_norm,
+                location_id = %location_id,
+                lan_outlet_id = %lan_outlet_id,
+                subnet_id = %subnet_id,
+                pxe_enabled,
+                "Failed to insert host into database"
+            );
             let msg = if let Some(db_err) = e.as_database_error() {
                 let code = db_err.code().map(|c| c.to_string()).unwrap_or_default();
                 if code == "23505" {
@@ -787,7 +984,7 @@ async fn hosts_create(
             } else {
                 "Datenbankfehler beim Speichern"
             };
-            render_hosts_new_error(&state, &session, msg).await
+            render_hosts_new_error(&state, &session, &form, msg).await
         }
     }
 }
@@ -1002,7 +1199,7 @@ async fn host_update(
             "select hostname, host(ip), mac
              from hosts
              where id <> $1
-               and (hostname = $2 or ip = $3 or mac = $4)
+               and (hostname = $2 or ip = $3::inet or mac = $4)
              limit 1",
         )
         .bind(id)
@@ -1026,7 +1223,7 @@ async fn host_update(
 
     let pxe_enabled = form.pxe_enabled.is_some();
 
-    let ok_pair: Option<i64> =
+    let ok_pair: Option<i32> =
         match sqlx::query_scalar("select 1 from lan_outlets where id = $1 and location_id = $2")
             .bind(lan_outlet_id)
             .bind(location_id)
@@ -1051,7 +1248,7 @@ async fn host_update(
     let res = sqlx::query(
         "update hosts
          set hostname = $1,
-             ip = $2,
+             ip = $2::inet,
              mac = $3,
              location_id = $4,
              lan_outlet_id = $5,
@@ -1866,6 +2063,558 @@ async fn api_lan_outlets_by_location(
     Ok(Json(items))
 }
 
+/* ----------------------------- PXE / iPXE ----------------------------- */
+
+fn validate_pxe_form(cfg: &Config, form: &PxeImageForm, files: &[String]) -> Result<ValidatedPxe, String> {
+    let name = form.name.trim();
+    if !valid_name(name) {
+        return Err("Name ist ungültig (erlaubt: A-Z, a-z, 0-9, ._- )".to_string());
+    }
+
+    let kind = form.kind.trim().to_lowercase();
+    if kind != "linux" && kind != "chain" {
+        return Err("Ungültiger Typ (kind)".to_string());
+    }
+
+    let arch = form.arch.trim().to_lowercase();
+    if arch != "any" && arch != "bios" && arch != "uefi" {
+        return Err("Ungültige Architektur".to_string());
+    }
+
+    let enabled = form.enabled.is_some();
+    let cmdline = form
+        .cmdline
+        .as_deref()
+        .map(|s| sanitize_cmdline(s.trim()))
+        .filter(|s| !s.is_empty());
+
+    let kernel_path = form
+        .kernel_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let initrd_path = form
+        .initrd_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let chain_url = form
+        .chain_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let root = StdPath::new(&cfg.pxe_root_dir);
+
+    if kind == "linux" {
+        let kernel = kernel_path.clone().ok_or_else(|| "Kernel-Pfad ist erforderlich".to_string())?;
+        if !files.contains(&kernel) && !ensure_path_allowed(root, &kernel) {
+            return Err("Kernel-Pfad ist ungültig oder existiert nicht".to_string());
+        }
+        if let Some(initrd) = initrd_path.as_ref() {
+            if !files.contains(initrd) && !ensure_path_allowed(root, initrd) {
+                return Err("Initrd-Pfad ist ungültig oder existiert nicht".to_string());
+            }
+        }
+    } else if kind == "chain" {
+        let url = chain_url.clone().ok_or_else(|| "Chain-URL ist erforderlich".to_string())?;
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("Chain-URL muss mit http:// oder https:// beginnen".to_string());
+        }
+    }
+
+    Ok(ValidatedPxe {
+        name: name.to_string(),
+        kind,
+        arch,
+        kernel_path,
+        initrd_path,
+        chain_url,
+        cmdline,
+        enabled,
+    })
+}
+
+async fn list_pxe_images(pool: &PgPool) -> Result<Vec<PxeImage>, ()> {
+    let rows: Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+        )>,
+        _,
+    > = sqlx::query_as(
+        "select id,
+                name,
+                kind,
+                arch,
+                kernel_path,
+                initrd_path,
+                chain_url,
+                cmdline,
+                enabled
+         from pxe_images
+         order by name asc",
+    )
+    .fetch_all(pool)
+    .await;
+
+    rows.map_err(|_| ()).map(|v| {
+        v.into_iter()
+            .map(
+                |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| PxeImage {
+                    id,
+                    name,
+                    kind,
+                    arch,
+                    kernel_path,
+                    initrd_path,
+                    chain_url,
+                    cmdline,
+                    enabled,
+                },
+            )
+            .collect()
+    })
+}
+
+async fn get_pxe_image(pool: &PgPool, id: i64) -> Result<Option<PxeImage>, ()> {
+    let row: Result<
+        Option<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+        )>,
+        _,
+    > = sqlx::query_as(
+        "select id,
+                name,
+                kind,
+                arch,
+                kernel_path,
+                initrd_path,
+                chain_url,
+                cmdline,
+                enabled
+         from pxe_images
+         where id = $1
+         limit 1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await;
+
+    row.map_err(|_| ()).map(|opt| {
+        opt.map(
+            |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| PxeImage {
+                id,
+                name,
+                kind,
+                arch,
+                kernel_path,
+                initrd_path,
+                chain_url,
+                cmdline,
+                enabled,
+            },
+        )
+    })
+}
+
+async fn insert_pxe_image(pool: &PgPool, data: &ValidatedPxe) -> Result<i64, String> {
+    let res = sqlx::query_scalar(
+        "insert into pxe_images (name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)
+         values ($1, $2, $3, $4, $5, $6, $7, $8)
+         returning id",
+    )
+    .bind(&data.name)
+    .bind(&data.kind)
+    .bind(&data.arch)
+    .bind(&data.kernel_path)
+    .bind(&data.initrd_path)
+    .bind(&data.chain_url)
+    .bind(&data.cmdline)
+    .bind(data.enabled)
+    .fetch_one(pool)
+    .await;
+
+    match res {
+        Ok(id) => Ok(id),
+        Err(e) => {
+            if let Some(db_err) = e.as_database_error() {
+                let code = db_err.code().map(|c| c.to_string()).unwrap_or_default();
+                if code == "23505" {
+                    return Err("Name ist bereits vorhanden".to_string());
+                }
+                if code == "23514" {
+                    return Err("Daten sind ungültig (Constraint verletzt)".to_string());
+                }
+            }
+            Err("Datenbankfehler beim Speichern".to_string())
+        }
+    }
+}
+
+async fn update_pxe_image(pool: &PgPool, id: i64, data: &ValidatedPxe) -> Result<(), String> {
+    let res = sqlx::query(
+        "update pxe_images
+         set name = $1,
+             kind = $2,
+             arch = $3,
+             kernel_path = $4,
+             initrd_path = $5,
+             chain_url = $6,
+             cmdline = $7,
+             enabled = $8
+         where id = $9",
+    )
+    .bind(&data.name)
+    .bind(&data.kind)
+    .bind(&data.arch)
+    .bind(&data.kernel_path)
+    .bind(&data.initrd_path)
+    .bind(&data.chain_url)
+    .bind(&data.cmdline)
+    .bind(data.enabled)
+    .bind(id)
+    .execute(pool)
+    .await;
+
+    match res {
+        Ok(r) => {
+            if r.rows_affected() == 0 {
+                Err("Eintrag nicht gefunden".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) => {
+            if let Some(db_err) = e.as_database_error() {
+                let code = db_err.code().map(|c| c.to_string()).unwrap_or_default();
+                if code == "23505" {
+                    return Err("Name ist bereits vorhanden".to_string());
+                }
+                if code == "23514" {
+                    return Err("Daten sind ungültig (Constraint verletzt)".to_string());
+                }
+            }
+            Err("Datenbankfehler beim Speichern".to_string())
+        }
+    }
+}
+
+async fn delete_pxe_image(pool: &PgPool, id: i64) -> Result<(), ()> {
+    sqlx::query("delete from pxe_images where id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+fn build_ipxe_script(cfg: &Config, images: &[PxeImage]) -> String {
+    let mut out = String::new();
+    let base_assets = cfg.pxe_http_base_url.as_str().trim_end_matches('/');
+    let boot_url = cfg
+        .base_url
+        .join("boot.ipxe")
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("{}/boot.ipxe", cfg.base_url));
+
+    out.push_str("#!ipxe\n");
+    out.push_str("set menu-timeout 5000\n");
+    out.push_str(&format!("set base {}\n\n", base_assets));
+    out.push_str(&format!("# tftp-server: {}\n", cfg.pxe_tftp_server));
+    out.push_str(&format!("# bios-bootfile: {}\n", cfg.pxe_bios_bootfile));
+    out.push_str(&format!("# uefi-bootfile: {}\n\n", cfg.pxe_uefi_bootfile));
+    out.push_str(":start\n");
+    out.push_str("menu IPManager PXE Boot Menu\n");
+    out.push_str("item --gap -- ----------------------------\n");
+    out.push_str("item local Local disk\n");
+    out.push_str("item shell iPXE shell\n");
+
+    for img in images {
+        if !img.enabled {
+            continue;
+        }
+        let name = sanitize_label(&img.name);
+        out.push_str(&format!("item img{} {} [{}]\n", img.id, name, img.arch));
+    }
+
+    out.push_str("choose --timeout ${menu-timeout} --default local selected || goto start\n");
+    out.push_str("goto ${selected}\n\n");
+
+    out.push_str(":local\nexit\n\n");
+    out.push_str(":shell\nshell\ngoto start\n\n");
+
+    for img in images {
+        if !img.enabled {
+            continue;
+        }
+        let label = format!("img{}", img.id);
+        out.push_str(&format!(":{}\n", label));
+        match img.kind.as_str() {
+            "linux" => {
+                if let Some(kernel) = &img.kernel_path {
+                    let cmd = sanitize_cmdline(img.cmdline.as_deref().unwrap_or(""));
+                    out.push_str(&format!("kernel ${{base}}/{kernel} {cmd}\n"));
+                    if let Some(initrd) = &img.initrd_path {
+                        out.push_str(&format!("initrd ${{base}}/{initrd}\n"));
+                    }
+                    out.push_str("boot || goto start\n\n");
+                }
+            }
+            "chain" => {
+                if let Some(url) = &img.chain_url {
+                    out.push_str(&format!("chain {url} || goto start\n\n"));
+                }
+            }
+            _ => {
+                out.push_str("goto start\n\n");
+            }
+        }
+    }
+
+    if cfg.pxe_enabled {
+        // Hint for iPXE direct chain if desired
+        out.push_str(&format!("# ipxe boot script served by {}\n", boot_url));
+    }
+
+    out
+}
+
+async fn boot_ipxe(State(state): State<AppState>) -> Response {
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let rows: Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+        )>,
+        _,
+    > = sqlx::query_as(
+        "select id,
+                name,
+                kind,
+                arch,
+                kernel_path,
+                initrd_path,
+                chain_url,
+                cmdline,
+                enabled
+         from pxe_images
+         where enabled = true
+         order by name asc",
+    )
+    .fetch_all(&state.pool)
+    .await;
+
+    let images = match rows {
+        Ok(v) => v
+            .into_iter()
+            .map(
+                |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| PxeImage {
+                    id,
+                    name,
+                    kind,
+                    arch,
+                    kernel_path,
+                    initrd_path,
+                    chain_url,
+                    cmdline,
+                    enabled,
+                },
+            )
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to load pxe images");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let script = build_ipxe_script(&state.config, &images);
+
+    (
+        axum::http::HeaderMap::from_iter(std::iter::once((
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        ))),
+        script,
+    )
+        .into_response()
+}
+
+async fn pxe_images_list(State(state): State<AppState>, session: Session) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let images = match list_pxe_images(&state.pool).await {
+        Ok(v) => v,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let mut ctx = Context::new();
+    add_auth_context(&mut ctx, &session).await;
+    ctx.insert("images", &images);
+    ctx.insert("pxe_enabled", &state.config.pxe_enabled);
+    render(&state.templates, "pxe_images_list.html", ctx)
+}
+
+async fn pxe_images_new(State(state): State<AppState>, session: Session) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let files = list_pxe_files(StdPath::new(&state.config.pxe_root_dir));
+
+    let mut ctx = Context::new();
+    add_auth_context(&mut ctx, &session).await;
+    ctx.insert("error", &Option::<String>::None);
+    ctx.insert("files", &files);
+    ctx.insert(
+        "form",
+        &serde_json::json!({
+            "name": "",
+            "kind": "linux",
+            "arch": "any",
+            "kernel_path": "",
+            "initrd_path": "",
+            "chain_url": "",
+            "cmdline": "",
+            "enabled": true
+        }),
+    );
+    ctx.insert("pxe_enabled", &state.config.pxe_enabled);
+    render(&state.templates, "pxe_images_new.html", ctx)
+}
+
+async fn pxe_images_create(
+    State(state): State<AppState>,
+    session: Session,
+    Form(form): Form<PxeImageForm>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let files = list_pxe_files(StdPath::new(&state.config.pxe_root_dir));
+
+    let validated = match validate_pxe_form(&state.config, &form, &files) {
+        Ok(v) => v,
+        Err(msg) => return render_pxe_new_error(&state, &session, &files, &form, &msg).await,
+    };
+
+    match insert_pxe_image(&state.pool, &validated).await {
+        Ok(_) => Redirect::to("/pxe/images").into_response(),
+        Err(msg) => render_pxe_new_error(&state, &session, &files, &form, &msg).await,
+    }
+}
+
+async fn pxe_images_edit(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let image = match get_pxe_image(&state.pool, id).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let files = list_pxe_files(StdPath::new(&state.config.pxe_root_dir));
+
+    let mut ctx = Context::new();
+    add_auth_context(&mut ctx, &session).await;
+    ctx.insert("error", &Option::<String>::None);
+    ctx.insert("files", &files);
+    ctx.insert("image", &image);
+    ctx.insert("pxe_enabled", &state.config.pxe_enabled);
+
+    render(&state.templates, "pxe_images_edit.html", ctx)
+}
+
+async fn pxe_images_update(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<i64>,
+    Form(form): Form<PxeImageForm>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let files = list_pxe_files(StdPath::new(&state.config.pxe_root_dir));
+    let validated = match validate_pxe_form(&state.config, &form, &files) {
+        Ok(v) => v,
+        Err(msg) => return render_pxe_edit_error(&state, &session, id, &files, &form, &msg).await,
+    };
+
+    match update_pxe_image(&state.pool, id, &validated).await {
+        Ok(_) => Redirect::to("/pxe/images").into_response(),
+        Err(msg) => render_pxe_edit_error(&state, &session, id, &files, &form, &msg).await,
+    }
+}
+
+async fn pxe_images_delete(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let _ = delete_pxe_image(&state.pool, id).await;
+    Redirect::to("/pxe/images").into_response()
+}
+
 /* ----------------------------- Rendering helpers ----------------------------- */
 
 fn render(tera: &Tera, template: &str, ctx: Context) -> Response {
@@ -1882,6 +2631,17 @@ fn render(tera: &Tera, template: &str, ctx: Context) -> Response {
     }
 }
 
+fn render_error_page(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Html(format!(
+            "<h1>Fehler</h1><p>{}</p>",
+            html_escape::encode_text(message)
+        )),
+    )
+        .into_response()
+}
+
 async fn render_login_error(tera: &Tera, session: &Session, msg: &str) -> Response {
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, session).await;
@@ -1889,21 +2649,52 @@ async fn render_login_error(tera: &Tera, session: &Session, msg: &str) -> Respon
     render(tera, "login.html", ctx)
 }
 
-async fn render_hosts_new_error(state: &AppState, session: &Session, msg: &str) -> Response {
-    let locations = load_locations(&state.pool).await.ok();
-    let lan_outlets = load_lan_outlets(&state.pool).await.ok();
-    let subnets = load_subnets(&state.pool).await.ok();
-
-    if locations.is_none() || lan_outlets.is_none() || subnets.is_none() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+async fn render_hosts_new_error(
+    state: &AppState,
+    session: &Session,
+    form: &HostCreateForm,
+    msg: &str,
+) -> Response {
+    let locations = match load_locations(&state.pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "DB error in render_hosts_new_error locations");
+            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Standorte");
+        }
+    };
+    let lan_outlets = match load_lan_outlets(&state.pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "DB error in render_hosts_new_error lan_outlets");
+            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der LAN-Dosen");
+        }
+    };
+    let subnets = match load_subnets(&state.pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "DB error in render_hosts_new_error subnets");
+            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Subnets");
+        }
+    };
 
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, session).await;
     ctx.insert("error", &Some(msg.to_string()));
-    ctx.insert("locations", &locations.unwrap());
-    ctx.insert("lan_outlets", &lan_outlets.unwrap());
-    ctx.insert("subnets", &subnets.unwrap());
+    ctx.insert("locations", &locations);
+    ctx.insert("lan_outlets", &lan_outlets);
+    ctx.insert("subnets", &subnets);
+    ctx.insert(
+        "form",
+        &serde_json::json!({
+            "hostname": form.hostname.trim(),
+            "ip": form.ip.trim(),
+            "mac": form.mac.trim(),
+            "location_id": form.location_id.trim(),
+            "lan_outlet_id": form.lan_outlet_id.trim(),
+            "subnet_id": form.subnet_id.trim(),
+            "pxe_enabled": form.pxe_enabled.is_some()
+        }),
+    );
 
     render(&state.templates, "hosts_new.html", ctx)
 }
@@ -1953,10 +2744,76 @@ async fn render_host_edit_error(
     render(&state.templates, "host_edit.html", ctx)
 }
 
+async fn render_pxe_new_error(
+    state: &AppState,
+    session: &Session,
+    files: &[String],
+    form: &PxeImageForm,
+    msg: &str,
+) -> Response {
+    let mut ctx = Context::new();
+    add_auth_context(&mut ctx, session).await;
+    ctx.insert("error", &Some(msg.to_string()));
+    ctx.insert("files", files);
+    ctx.insert(
+        "form",
+        &serde_json::json!({
+            "name": form.name.trim(),
+            "kind": form.kind.trim(),
+            "arch": form.arch.trim(),
+            "kernel_path": form.kernel_path.as_deref().unwrap_or(""),
+            "initrd_path": form.initrd_path.as_deref().unwrap_or(""),
+            "chain_url": form.chain_url.as_deref().unwrap_or(""),
+            "cmdline": form.cmdline.as_deref().unwrap_or(""),
+            "enabled": form.enabled.is_some()
+        }),
+    );
+    ctx.insert("pxe_enabled", &state.config.pxe_enabled);
+    render(&state.templates, "pxe_images_new.html", ctx)
+}
+
+async fn render_pxe_edit_error(
+    state: &AppState,
+    session: &Session,
+    id: i64,
+    files: &[String],
+    form: &PxeImageForm,
+    msg: &str,
+) -> Response {
+    let mut ctx = Context::new();
+    add_auth_context(&mut ctx, session).await;
+    ctx.insert("error", &Some(msg.to_string()));
+    ctx.insert("files", files);
+    ctx.insert(
+        "image",
+        &serde_json::json!({
+            "id": id,
+            "name": form.name.trim(),
+            "kind": form.kind.trim(),
+            "arch": form.arch.trim(),
+            "kernel_path": form.kernel_path.as_deref().unwrap_or(""),
+            "initrd_path": form.initrd_path.as_deref().unwrap_or(""),
+            "chain_url": form.chain_url.as_deref().unwrap_or(""),
+            "cmdline": form.cmdline.as_deref().unwrap_or(""),
+            "enabled": form.enabled.is_some()
+        }),
+    );
+    ctx.insert("pxe_enabled", &state.config.pxe_enabled);
+    render(&state.templates, "pxe_images_edit.html", ctx)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{validate_ipv4, validate_mac};
+    use super::{
+        build_ipxe_script, ensure_path_allowed, validate_ipv4, validate_mac, validate_pxe_form,
+        PxeImage, PxeImageForm,
+    };
     use std::net::Ipv4Addr;
+    use url::Url;
+    use crate::config::Config;
+    use std::time::Duration;
+    use std::fs;
+    use tempfile;
 
     #[test]
     fn validate_ipv4_accepts_plain_address() {
@@ -1976,5 +2833,135 @@ mod tests {
         assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
         assert!(validate_mac("001A2B3C4D5E").is_ok()); // plain hex is allowed by parser
         assert!(validate_mac("ZZ:11:22:33:44:55").is_err());
+    }
+
+    fn dummy_config() -> Config {
+        Config {
+            database_url: "postgres://user:pass@localhost/db".to_string(),
+            db_max_connections: 1,
+            db_min_connections: 0,
+            bind_addr: "127.0.0.1:3000".to_string(),
+            base_url: Url::parse("http://localhost:3000/").unwrap(),
+            initial_admin_user: "admin".to_string(),
+            initial_admin_password: "pass".to_string(),
+            session_secret: "secretsecretsecretsecretsecretsecret".to_string(),
+            session_cookie_name: "sess".to_string(),
+            session_cookie_secure: false,
+            session_ttl: Duration::from_secs(3600),
+            pxe_enabled: true,
+            pxe_root_dir: "/var/lib/ipmanager/pxe".to_string(),
+            pxe_http_base_url: Url::parse("http://localhost:3000/pxe-assets").unwrap(),
+            pxe_tftp_server: "192.0.2.1".to_string(),
+            pxe_bios_bootfile: "undionly.kpxe".to_string(),
+            pxe_uefi_bootfile: "ipxe.efi".to_string(),
+            kea_config_path: "/etc/kea/kea-dhcp4.conf".to_string(),
+            kea_reload_mode: "none".to_string(),
+            kea_control_agent_url: None,
+            kea_api_timeout: Duration::from_secs(5),
+            kea_control_agent_username: None,
+            kea_control_agent_password: None,
+        }
+    }
+
+    #[test]
+    fn build_ipxe_includes_items_and_kernel() {
+        let cfg = dummy_config();
+        let images = vec![
+            PxeImage {
+                id: 1,
+                name: "Linux".to_string(),
+                kind: "linux".to_string(),
+                arch: "any".to_string(),
+                kernel_path: Some("vmlinuz".to_string()),
+                initrd_path: Some("initrd.img".to_string()),
+                chain_url: None,
+                cmdline: Some("console=ttyS0".to_string()),
+                enabled: true,
+            },
+            PxeImage {
+                id: 2,
+                name: "Chain".to_string(),
+                kind: "chain".to_string(),
+                arch: "any".to_string(),
+                kernel_path: None,
+                initrd_path: None,
+                chain_url: Some("http://example.com/ipxe".to_string()),
+                cmdline: None,
+                enabled: true,
+            },
+        ];
+
+        let script = build_ipxe_script(&cfg, &images);
+        assert!(script.contains("#!ipxe"));
+        assert!(script.contains("item img1 Linux"));
+        assert!(script.contains("kernel ${base}/vmlinuz console=ttyS0"));
+        assert!(script.contains("initrd ${base}/initrd.img"));
+        assert!(script.contains("item img2 Chain"));
+        assert!(script.contains("chain http://example.com/ipxe"));
+    }
+
+    #[test]
+    fn validate_pxe_form_linux_ok() {
+        let cfg = dummy_config();
+        let files = vec!["vmlinuz".to_string(), "initrd.img".to_string()];
+        let form = PxeImageForm {
+            name: "test-linux".to_string(),
+            kind: "linux".to_string(),
+            arch: "any".to_string(),
+            kernel_path: Some("vmlinuz".to_string()),
+            initrd_path: Some("initrd.img".to_string()),
+            chain_url: None,
+            cmdline: Some("console=ttyS0\nroot=/dev/sda1".to_string()),
+            enabled: Some("on".to_string()),
+        };
+        let validated = validate_pxe_form(&cfg, &form, &files).unwrap();
+        assert_eq!(validated.name, "test-linux");
+        assert_eq!(validated.kernel_path.as_deref(), Some("vmlinuz"));
+        assert_eq!(validated.initrd_path.as_deref(), Some("initrd.img"));
+        assert_eq!(validated.cmdline.as_deref(), Some("console=ttyS0 root=/dev/sda1"));
+        assert!(validated.enabled);
+    }
+
+    #[test]
+    fn validate_pxe_form_rejects_parent_dir() {
+        let cfg = dummy_config();
+        let files = vec!["ok".to_string()];
+        let form = PxeImageForm {
+            name: "bad".to_string(),
+            kind: "linux".to_string(),
+            arch: "any".to_string(),
+            kernel_path: Some("../evil".to_string()),
+            initrd_path: None,
+            chain_url: None,
+            cmdline: None,
+            enabled: None,
+        };
+        assert!(validate_pxe_form(&cfg, &form, &files).is_err());
+    }
+
+    #[test]
+    fn validate_pxe_form_chain_requires_url() {
+        let cfg = dummy_config();
+        let files = vec![];
+        let form = PxeImageForm {
+            name: "chain1".to_string(),
+            kind: "chain".to_string(),
+            arch: "any".to_string(),
+            kernel_path: None,
+            initrd_path: None,
+            chain_url: None,
+            cmdline: None,
+            enabled: None,
+        };
+        assert!(validate_pxe_form(&cfg, &form, &files).is_err());
+    }
+
+    #[test]
+    fn ensure_path_allowed_checks_root() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file_path = tmpdir.path().join("file.bin");
+        fs::write(&file_path, b"data").unwrap();
+        assert!(ensure_path_allowed(tmpdir.path(), "file.bin"));
+        assert!(!ensure_path_allowed(tmpdir.path(), "../file.bin"));
     }
 }

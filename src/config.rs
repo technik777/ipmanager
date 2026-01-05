@@ -24,6 +24,14 @@ pub struct Config {
     pub session_cookie_secure: bool,
     pub session_ttl: Duration,
 
+    // PXE/iPXE
+    pub pxe_enabled: bool,
+    pub pxe_root_dir: String,
+    pub pxe_http_base_url: Url,
+    pub pxe_tftp_server: String,
+    pub pxe_bios_bootfile: String,
+    pub pxe_uefi_bootfile: String,
+
     // KEA (neu)
     pub kea_config_path: String,
     /// "none" | "api"
@@ -55,6 +63,14 @@ impl Config {
         let session_ttl =
             env_duration_secs("SESSION_TTL_SECS").unwrap_or(Duration::from_secs(60 * 60 * 24));
 
+        let pxe_enabled = env_bool("PXE_ENABLED").unwrap_or(false);
+        let pxe_root_dir = env_default("PXE_ROOT_DIR", "/var/lib/ipmanager/pxe");
+        let pxe_http_base_url = Url::parse(&env_default("PXE_HTTP_BASE_URL", "http://127.0.0.1:3000/pxe-assets"))
+            .context("PXE_HTTP_BASE_URL must be a valid URL")?;
+        let pxe_tftp_server = env_default("PXE_TFTP_SERVER", "127.0.0.1");
+        let pxe_bios_bootfile = env_default("PXE_BIOS_BOOTFILE", "undionly.kpxe");
+        let pxe_uefi_bootfile = env_default("PXE_UEFI_BOOTFILE", "ipxe.efi");
+
         // KEA
         let kea_config_path = env_default("KEA_CONFIG_PATH", "/etc/kea/kea-dhcp4.conf");
         let kea_reload_mode = env_default("KEA_RELOAD_MODE", "none");
@@ -84,6 +100,13 @@ impl Config {
             session_cookie_name,
             session_cookie_secure,
             session_ttl,
+
+            pxe_enabled,
+            pxe_root_dir,
+            pxe_http_base_url,
+            pxe_tftp_server,
+            pxe_bios_bootfile,
+            pxe_uefi_bootfile,
 
             // KEA
             kea_config_path,
