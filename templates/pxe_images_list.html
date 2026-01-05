@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}PXE Images{% endblock title %}
+
+{% block content %}
+  <h1>PXE Images</h1>
+
+  <p>
+    <a href="/pxe/images/new">Neu</a>
+  </p>
+
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Typ</th>
+        <th>Arch</th>
+        <th>Enabled</th>
+        <th>Aktionen</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for img in images %}
+        <tr>
+          <td>{{ img.name }}</td>
+          <td>{{ img.kind }}</td>
+          <td>{{ img.arch }}</td>
+          <td>{{ img.enabled }}</td>
+          <td>
+            <a href="/pxe/images/{{ img.id }}/edit">Bearbeiten</a>
+            <form method="post" action="/pxe/images/{{ img.id }}/delete" style="display:inline;" onsubmit="return confirm('Löschen?');">
+              <button type="submit">Löschen</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr>
+          <td colspan="5">Keine PXE Images vorhanden.</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock content %}

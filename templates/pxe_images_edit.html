@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+
+{% block title %}PXE Image bearbeiten{% endblock title %}
+
+{% block content %}
+  <h1>PXE Image bearbeiten</h1>
+
+  {% if error %}
+    <p style="color:red;">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" action="/pxe/images/{{ image.id }}/edit">
+    <div>
+      <label>Name</label><br />
+      <input type="text" name="name" value="{{ image.name }}" required />
+    </div>
+
+    <div>
+      <label>Typ</label><br />
+      <select name="kind" id="kind-select">
+        <option value="linux" {% if image.kind == "linux" %}selected{% endif %}>linux</option>
+        <option value="chain" {% if image.kind == "chain" %}selected{% endif %}>chain</option>
+      </select>
+    </div>
+
+    <div>
+      <label>Architektur</label><br />
+      <select name="arch">
+        <option value="any" {% if image.arch == "any" %}selected{% endif %}>any</option>
+        <option value="bios" {% if image.arch == "bios" %}selected{% endif %}>bios</option>
+        <option value="uefi" {% if image.arch == "uefi" %}selected{% endif %}>uefi</option>
+      </select>
+    </div>
+
+    <div data-kind="linux">
+      <label>Kernel (relativ zu PXE_ROOT_DIR)</label><br />
+      <select name="kernel_path">
+        <option value="">-- auswählen --</option>
+        {% for f in files %}
+          <option value="{{ f }}" {% if image.kernel_path == f %}selected{% endif %}>{{ f }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div data-kind="linux">
+      <label>Initrd (optional)</label><br />
+      <select name="initrd_path">
+        <option value="">(keine)</option>
+        {% for f in files %}
+          <option value="{{ f }}" {% if image.initrd_path == f %}selected{% endif %}>{{ f }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div data-kind="linux">
+      <label>Cmdline (optional)</label><br />
+      <textarea name="cmdline" rows="2" cols="50">{{ image.cmdline | default(value="") }}</textarea>
+    </div>
+
+    <div data-kind="chain">
+      <label>Chain URL</label><br />
+      <input type="text" name="chain_url" value="{{ image.chain_url | default(value="") }}" />
+    </div>
+
+    <div>
+      <label>
+        <input type="checkbox" name="enabled" {% if image.enabled %}checked{% endif %} />
+        Aktiviert
+      </label>
+    </div>
+
+    <div style="margin-top:12px;">
+      <button type="submit">Speichern</button>
+      <a href="/pxe/images">Abbrechen</a>
+    </div>
+  </form>
+
+  <script>
+    const kindSelect = document.getElementById('kind-select');
+    const toggle = () => {
+      const kind = kindSelect.value;
+      document.querySelectorAll('[data-kind]').forEach(el => {
+        el.style.display = el.getAttribute('data-kind') === kind ? 'block' : 'none';
+      });
+    };
+    kindSelect.addEventListener('change', toggle);
+    toggle();
+  </script>
+{% endblock content %}

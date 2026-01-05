@@ -9,9 +9,8 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let cfg = config::Config::from_env()?;
     tracing::info!(
@@ -46,6 +45,7 @@ async fn main() -> Result<()> {
     let state = web::AppState {
         pool,
         templates: std::sync::Arc::new(tera),
+        config: cfg.clone(),
     };
 
     let app = web::router(state).layer(session_layer);

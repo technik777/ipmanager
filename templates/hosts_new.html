@@ -10,29 +10,33 @@
 <form method="post" action="/hosts">
   <label>
     Hostname<br />
-    <input name="hostname" required />
+    <input name="hostname" required value="{{ form.hostname | default(value='') }}" />
   </label>
   <br /><br />
 
   <label>
     IP (IPv4/IPv6)<br />
-    <input name="ip" required />
+    <input name="ip" required value="{{ form.ip | default(value='') }}" />
   </label>
   <br /><br />
 
   <label>
     MAC (wird normalisiert)<br />
-    <input name="mac" required />
+    <input name="mac" required value="{{ form.mac | default(value='') }}" />
   </label>
   <br /><br />
 
   <label>
     Standort<br />
     <select id="location_id" name="location_id" required>
-      <option value="" selected>Bitte wählen…</option>
-      {% for l in locations %}
-        <option value="{{ l.id }}">{{ l.name }}</option>
-      {% endfor %}
+      {% if locations | length == 0 %}
+        <option value="" selected disabled>Keine Standorte vorhanden</option>
+      {% else %}
+        <option value="" {% if not form.location_id %}selected{% endif %}>Bitte wählen…</option>
+        {% for l in locations %}
+          <option value="{{ l.id }}" {% if form.location_id == l.id %}selected{% endif %}>{{ l.name }}</option>
+        {% endfor %}
+      {% endif %}
     </select>
   </label>
   <br /><br />
@@ -48,17 +52,21 @@
   <label>
     Subnet<br />
     <select name="subnet_id" required>
-      <option value="" selected>Bitte wählen…</option>
-      {% for s in subnets %}
-        <option value="{{ s.id }}">{{ s.name }} ({{ s.cidr }})</option>
-      {% endfor %}
+      {% if subnets | length == 0 %}
+        <option value="" selected disabled>Keine Subnetze vorhanden – zuerst Subnetz anlegen</option>
+      {% else %}
+        <option value="" {% if not form.subnet_id %}selected{% endif %} disabled>Bitte wählen…</option>
+        {% for s in subnets %}
+          <option value="{{ s.id }}" {% if form.subnet_id == s.id %}selected{% endif %}>{{ s.name }} ({{ s.cidr }})</option>
+        {% endfor %}
+      {% endif %}
     </select>
   </label>
   <br /><br />
 
   <label>
     PXE enabled
-    <input type="checkbox" name="pxe_enabled" value="true" />
+    <input type="checkbox" name="pxe_enabled" value="true" {% if form.pxe_enabled %}checked{% endif %} />
   </label>
   <br /><br />
 
@@ -69,6 +77,8 @@
 (function () {
   const locationSel = document.getElementById("location_id");
   const outletSel = document.getElementById("lan_outlet_id");
+  const initialLocationId = "{{ form.location_id | default(value='') }}";
+  const initialOutletId = "{{ form.lan_outlet_id | default(value='') }}";
 
   function setOutletPlaceholder(text) {
     outletSel.innerHTML = "";
@@ -130,6 +140,11 @@
     }
     loadOutlets(loc, null);
   });
+
+  if (initialLocationId) {
+    locationSel.value = initialLocationId;
+    loadOutlets(initialLocationId, initialOutletId || null);
+  }
 })();
 </script>
 

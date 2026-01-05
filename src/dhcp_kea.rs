@@ -43,6 +43,9 @@ struct Dhcp4 {
     #[serde(rename = "lease-database")]
     lease_database: LeaseDatabase,
 
+    #[serde(rename = "client-classes", skip_serializing_if = "Option::is_none")]
+    client_classes: Option<Vec<ClientClass>>,
+
     #[serde(rename = "subnet4")]
     subnet4: Vec<Subnet4>,
 
@@ -61,6 +64,16 @@ struct LeaseDatabase {
     typ: String,
     persist: bool,
     name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientClass {
+    name: String,
+    test: String,
+    #[serde(rename = "boot-file-name", skip_serializing_if = "Option::is_none")]
+    boot_file_name: Option<String>,
+    #[serde(rename = "next-server", skip_serializing_if = "Option::is_none")]
+    next_server: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,7 +102,7 @@ struct Reservation {
     hostname: String,
 }
 
-pub async fn render_dhcp4_config(pool: &PgPool) -> Result<String> {
+pub async fn render_dhcp4_config(pool: &PgPool, cfg: &Config) -> Result<String> {
     // IMPORTANT:
     // Postgres inet::text renders with a /32 (e.g. 192.168.174.50/32).
     // We want plain host addresses for Kea pools, so use host(inet).
@@ -173,6 +186,7 @@ pub async fn render_dhcp4_config(pool: &PgPool) -> Result<String> {
                 persist: true,
                 name: "/var/lib/kea/dhcp4.leases".to_string(),
             },
+            client_classes: pxe_client_classes(cfg),
             subnet4: subnet_blocks,
             user_context: serde_json::json!({
                 "generated-by": "ipmanager",
@@ -182,6 +196,39 @@ pub async fn render_dhcp4_config(pool: &PgPool) -> Result<String> {
     };
 
     Ok(serde_json::to_string_pretty(&root).context("failed to serialize kea config")?)
+}
+
+fn pxe_client_classes(cfg: &Config) -> Option<Vec<ClientClass>> {
+    if !cfg.pxe_enabled {
+        return None;
+    }
+
+    let boot_ipxe_url = cfg
+        .base_url
+        .join("boot.ipxe")
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("{}/boot.ipxe", cfg.base_url));
+
+    Some(vec![
+        ClientClass {
+            name: "ipxe".to_string(),
+            test: "member('VENDOR_CLASS_iPXE')".to_string(),
+            boot_file_name: Some(boot_ipxe_url),
+            next_server: None,
+        },
+        ClientClass {
+            name: "uefi_x64".to_string(),
+            test: "option[93].hex == 0x0009".to_string(),
+            boot_file_name: Some(cfg.pxe_uefi_bootfile.clone()),
+            next_server: Some(cfg.pxe_tftp_server.clone()),
+        },
+        ClientClass {
+            name: "bios".to_string(),
+            test: "not member('ipxe') and not member('uefi_x64')".to_string(),
+            boot_file_name: Some(cfg.pxe_bios_bootfile.clone()),
+            next_server: Some(cfg.pxe_tftp_server.clone()),
+        },
+    ])
 }
 
 /// Determine the Kea pool range for a subnet:
@@ -272,7 +319,7 @@ fn ipv4_usable_bounds(net: &ipnet::Ipv4Net) -> Result<(Ipv4Addr, Ipv4Addr)> {
 }
 
 pub async fn deploy(pool: &PgPool, cfg: &Config) -> Result<DeployOutcome> {
-    let json = render_dhcp4_config(pool).await?;
+    let json = render_dhcp4_config(pool, cfg).await?;
 
     write_atomic(&cfg.kea_config_path, json.as_bytes()).context("failed to write kea config")?;
 
@@ -393,3 +440,61 @@ async fn reload_via_api(cfg: &Config) -> (bool, String) {
     (true, text)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use url::Url;
+
+    fn dummy_config(pxe_enabled: bool) -> Config {
+        Config {
+            database_url: "postgres://user:pass@localhost/db".to_string(),
+            db_max_connections: 1,
+            db_min_connections: 0,
+            bind_addr: "127.0.0.1:3000".to_string(),
+            base_url: Url::parse("http://localhost:3000/").unwrap(),
+            initial_admin_user: "admin".to_string(),
+            initial_admin_password: "secret".to_string(),
+            session_secret: "secretsecretsecretsecretsecretsecret".to_string(),
+            session_cookie_name: "sess".to_string(),
+            session_cookie_secure: false,
+            session_ttl: Duration::from_secs(3600),
+            pxe_enabled,
+            pxe_root_dir: "/var/lib/ipmanager/pxe".to_string(),
+            pxe_http_base_url: Url::parse("http://localhost:3000/pxe-assets").unwrap(),
+            pxe_tftp_server: "192.0.2.1".to_string(),
+            pxe_bios_bootfile: "undionly.kpxe".to_string(),
+            pxe_uefi_bootfile: "ipxe.efi".to_string(),
+            kea_config_path: "/etc/kea/kea-dhcp4.conf".to_string(),
+            kea_reload_mode: "none".to_string(),
+            kea_control_agent_url: None,
+            kea_api_timeout: Duration::from_secs(5),
+            kea_control_agent_username: None,
+            kea_control_agent_password: None,
+        }
+    }
+
+    #[test]
+    fn pxe_classes_absent_when_disabled() {
+        let cfg = dummy_config(false);
+        assert!(pxe_client_classes(&cfg).is_none());
+    }
+
+    #[test]
+    fn pxe_classes_present_and_ordered() {
+        let cfg = dummy_config(true);
+        let classes = pxe_client_classes(&cfg).expect("should build");
+        assert_eq!(classes.len(), 3);
+        assert_eq!(classes[0].name, "ipxe");
+        assert!(classes[0]
+            .boot_file_name
+            .as_ref()
+            .unwrap()
+            .ends_with("/boot.ipxe"));
+        assert_eq!(classes[1].name, "uefi_x64");
+        assert_eq!(classes[1].next_server.as_deref(), Some("192.0.2.1"));
+        assert_eq!(classes[1].boot_file_name.as_deref(), Some("ipxe.efi"));
+        assert_eq!(classes[2].name, "bios");
+        assert_eq!(classes[2].boot_file_name.as_deref(), Some("undionly.kpxe"));
+    }
+}

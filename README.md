@@ -1,190 +1,290 @@
-# **IP-Management-System für Kea DHCP und PostgreSQL**
+````markdown
+# IPManager – IP-Management & Kea DHCP Control (PostgreSQL, Rust/Axum) inkl. PXE/iPXE-Menü
 
-## **Überblick**
+IPManager ist eine Webanwendung zur Verwaltung von Hosts, Subnetzen und DHCP-relevanten Daten in PostgreSQL sowie zur Generierung/Deploy von Kea DHCPv4-Konfigurationen. Zusätzlich bietet IPManager ein PXE/iPXE-Boot-Menü, das dynamisch aus der Datenbank erzeugt wird und Boot-Images per Web-UI verwaltbar macht.
 
-Das IP-Management-System verwaltet IP-Adressen, DHCP-Leases und Hosts in einer Netzwerkumgebung, die mit dem Kea DHCP-Server und einer PostgreSQL-Datenbank integriert ist. Es bietet eine Webanwendung zur Verwaltung von Hosts, Subnetzen und DHCP-Pools, um Netzwerkadministratoren zu unterstützen.
+## Features
 
-### **Technologien:**
+### Core
+- Web-UI für:
+  - Hosts (Create/Read/Update/Delete)
+  - Subnetze & DHCP-Pools (je nach Projektstand)
+- PostgreSQL als zentrale Datenbank (SQLx)
+- Rust/Axum Backend, Tera Templates (Server Side Rendering)
+- Sessions via `tower-sessions` (stabiler Key aus `SESSION_SECRET`)
+- Strikte Eingabevalidierung:
+  - IPv4-only (IPv6 wird abgewiesen)
+  - MAC-Formatprüfung
+  - Duplicate-Checks (Hostname/IP/MAC) vor DB-Schreiboperationen
+- Unit-Tests + optionale Integrationstests gegen echte PostgreSQL-DB
 
-* **Backend:** Rust, Axum (Webframework), SQLx (PostgreSQL-Interaktion)
-* **Frontend:** Tera Templates, HTML/CSS
-* **Datenbank:** PostgreSQL
-* **DHCP:** Kea DHCP
-* **Session-Management:** Tower Sessions (mit PostgreSQL-Store)
+### Kea DHCPv4 Integration
+- Generierung einer Kea DHCPv4 JSON-Konfiguration aus DB/Config
+- PXE/iPXE Bootfile-Logik über globale `client-classes`:
+  - iPXE Clients → erhalten direkt `boot.ipxe` (HTTP)
+  - UEFI x86_64 → erhalten UEFI-iPXE Bootfile via TFTP
+  - BIOS (Catch-all) → erhalten BIOS-iPXE Bootfile via TFTP
 
-### **Hauptfunktionen:**
-
-1. **Host-Management:**
-
-   * Hinzufügen, Bearbeiten und Anzeigen von Hosts.
-   * Validierung von IP-Adressen (IPv4) und MAC-Adressen.
-   * Zuordnung von Hosts zu Subnetzen und LAN-Dosen.
-
-2. **Subnetz-Management:**
-
-   * Verwaltung von Subnetzen und deren zugehörigen DHCP-Pools.
-   * Prüfung von DHCP-Poolbereichen (Start/Ende) auf Gültigkeit.
-
-3. **DHCP-Pool-Management:**
-
-   * Prüfung auf gültige IP-Adressen innerhalb eines Subnetzes.
-   * Sicherstellung, dass IP-Bereiche korrekt eingegeben werden.
-
-4. **Fehler und Validierungen:**
-
-   * IP-Adressen und Subnetzzugehörigkeit müssen geprüft werden, um ungültige Daten zu verhindern.
-   * Fehlende Validierungen beim Anlegen von Hosts und Subnetzen wurden hinzugefügt.
+### PXE/iPXE Boot Menü
+- Web-UI CRUD für PXE-Images (Linux/Chain)
+- Sichere Dateiauswahl (Dropdown) aus einem konfigurierten PXE-Root-Verzeichnis
+- `/pxe-assets/*` liefert PXE-Dateien per HTTP (nur bei aktivem PXE)
+- `/boot.ipxe` generiert dynamisch ein iPXE-Menü aus DB-Einträgen
 
 ---
 
-## **Systemarchitektur**
+## Anforderungen
 
-### **1. Backend (Rust mit Axum und SQLx)**
-
-* Das Backend ist in **Rust** implementiert und nutzt **Axum** als Webframework.
-* **SQLx** wird zur Interaktion mit der PostgreSQL-Datenbank verwendet, wobei asynchrone Datenbankoperationen durchgeführt werden.
-* Die Kommunikation mit der Kea DHCP-API erfolgt über HTTP-Requests.
-
-### **2. PostgreSQL-Datenbank**
-
-* Die Datenbank speichert alle relevanten Informationen über Hosts, Subnetze, DHCP-Pools und deren Zuordnungen.
-* **Tabellen:**
-
-  * **Hosts:** Enthält Informationen zu Hosts, einschließlich ihrer IP-Adressen und MAC-Adressen.
-  * **Subnetze:** Enthält Subnetz-Informationen, einschließlich CIDR und zugehöriger DHCP-Pool-Bereiche.
-  * **DHCP-Pools:** Verwalten IP-Bereiche für DHCP-Leases.
-
-### **3. DHCP-Integration (Kea DHCP)**
-
-* Kea DHCP wird zur Zuweisung von IP-Adressen in der Netzwerkumgebung verwendet. Das System kann DHCP-Pools und -Subnetze konfigurieren und überwachen.
-* Die Kea DHCP-Konfiguration wird über JSON-Dateien verwaltet, die durch die Webanwendung erstellt und angepasst werden können.
+- Rust Toolchain (stable) + Cargo
+- PostgreSQL
+- (Optional) Kea DHCP Server für produktiven Betrieb
+- (Optional) TFTP Server / Bereitstellung von iPXE-Binaries (BIOS/UEFI), wenn PXE genutzt wird
 
 ---
 
-## **Installation und Setup**
+## Projektstruktur (high level)
 
-### **Voraussetzungen**
-
-* **Rust** und **Cargo** (Rust’s Paketmanager und Build-Tool)
-* **PostgreSQL** für die Datenbank
-* **Kea DHCP** für den DHCP-Server
-* **Docker** (optional, für schnelle Testumgebungen)
-
-### **1. PostgreSQL-Datenbank einrichten**
-
-* Erstelle eine PostgreSQL-Datenbank:
-
-  ```bash
-  createdb ipmanager_db
-  ```
-
-* Lege die erforderlichen Tabellen an:
-
-  ```sql
-  CREATE TABLE hosts (
-      id SERIAL PRIMARY KEY,
-      ip_address INET NOT NULL,
-      mac_address VARCHAR(17) NOT NULL,
-      hostname VARCHAR(255) UNIQUE NOT NULL
-  );
-
-  CREATE TABLE subnets (
-      id SERIAL PRIMARY KEY,
-      cidr VARCHAR(18) NOT NULL,
-      dns_zone VARCHAR(255),
-      reverse_zone VARCHAR(255)
-  );
-
-  CREATE TABLE dhcp_pools (
-      id SERIAL PRIMARY KEY,
-      subnet_id INT REFERENCES subnets(id),
-      start_ip INET NOT NULL,
-      end_ip INET NOT NULL
-  );
-  ```
-
-### **2. Abhängigkeiten installieren**
-
-* Füge die Abhängigkeiten in `Cargo.toml` hinzu:
-
-  ```toml
-  [dependencies]
-  axum = "0.5"
-  sqlx = { version = "0.5", features = ["postgres", "runtime-tokio-native-tls"] }
-  tokio = { version = "1", features = ["full"] }
-  tower-sessions = "0.2"
-  ipnetwork = "0.18"
-  regex = "1"
-  ```
-
-* Installiere alle Abhängigkeiten:
-
-  ```bash
-  cargo build
-  ```
-
-### **3. Kea DHCP Integration**
-
-* Konfiguriere den Kea DHCP-Server, um das IP-Management-System zu nutzen. Das System stellt sicher, dass die generierten Konfigurationen für Kea korrekt sind und dass Subnetze und DHCP-Pools dynamisch verwaltet werden.
+- `main.rs` – Router/Server-Setup, Session-Layer, Static Serving (PXE Assets)
+- `config.rs` – Laden der Konfiguration aus Environment
+- `web.rs` – Webhandler/Validierungen/CRUD
+- `dhcp_kea.rs` – Kea DHCPv4 JSON Generator (inkl. PXE client-classes)
+- `migrations/` – SQL Migrationen (inkl. PXE-Images Tabelle)
+- `templates/` – Tera Templates (inkl. PXE UI)
 
 ---
 
-## **Hauptfunktionen und Endpunkte**
+## Konfiguration (Environment)
 
-### **1. Host-Management**
+IPManager wird über Environment Variablen konfiguriert. Verwende eine `.env` Datei (z.B. über `dotenv`) oder setze Variablen im Service.
 
-* **POST /hosts/create**: Erstellt einen neuen Host. Überprüft, ob die IP-Adresse und MAC-Adresse gültig sind und ob sie bereits existieren.
-* **PUT /hosts/update**: Aktualisiert einen bestehenden Host. Überprüft die IP-Adresse und MAC-Adresse auf Gültigkeit.
-* **GET /hosts/{id}**: Zeigt die Details eines Hosts an.
-* **GET /hosts**: Listet alle Hosts auf.
+### Pflicht (typischer Betrieb)
+- `DATABASE_URL`
+  - Beispiel: `postgres://user:pass@localhost:5432/ipmanager`
+- `SESSION_SECRET`
+  - Muss gesetzt sein (kein Default). Verwende einen ausreichend langen zufälligen Wert.
+- `SESSION_COOKIE_NAME` (optional, Default: `ipmanager_session`)
+- `SESSION_COOKIE_SECURE` (optional; `true` für HTTPS-only Cookies)
+- `SESSION_TTL` (optional; je nach Config-Implementierung)
 
-### **2. Subnetz-Management**
+### Optional: Integrationstests mit echter DB
+- `TEST_DATABASE_URL`
+  - Wenn gesetzt, laufen DB-Integrationstests gegen diese Datenbank.
+  - Wenn nicht gesetzt, werden Integrationstests sauber übersprungen.
 
-* **POST /subnets/create**: Erstellt ein neues Subnetz und fügt DHCP-Pools hinzu.
-* **PUT /subnets/update**: Aktualisiert ein bestehendes Subnetz.
-* **GET /subnets/{id}**: Zeigt die Details eines Subnetzes an.
-* **GET /subnets**: Listet alle Subnetze auf.
+### PXE/iPXE (nur wenn PXE genutzt wird)
+- `PXE_ENABLED` (true/false)
+- `PXE_ROOT_DIR`
+  - Verzeichnis mit Boot-Artefakten (Kernel/Initrd/iPXE Binaries etc.)
+- `PXE_HTTP_BASE_URL`
+  - Basis-URL, unter der `/pxe-assets` erreichbar ist (z.B. `http://ipmanager:8080/pxe-assets`)
+- `PXE_TFTP_SERVER`
+  - IP/Hostname des TFTP-Servers (für Kea next-server / Bootloader-Download)
+- `PXE_BIOS_BOOTFILE`
+  - Bootfile für BIOS (z.B. `undionly.kpxe` oder `ipxe.pxe`)
+- `PXE_UEFI_BOOTFILE`
+  - Bootfile für UEFI x86_64 (z.B. `ipxe.efi` oder `snponly.efi`)
 
-### **3. DHCP-Pool-Management**
-
-* **POST /dhcp-pools/create**: Erstellt einen neuen DHCP-Pool.
-* **PUT /dhcp-pools/update**: Aktualisiert einen bestehenden DHCP-Pool.
-* **GET /dhcp-pools/{id}**: Zeigt die Details eines DHCP-Pools an.
-
-### **4. Fehlermeldungen und Validierungen**
-
-* **IP-Adressvalidierung:** Überprüft, ob die IP-Adresse im gültigen IPv4-Format vorliegt.
-* **MAC-Adressvalidierung:** Stellt sicher, dass die MAC-Adresse im richtigen Format vorliegt.
-* **Duplicate-Check:** Vor der Speicherung eines Hosts wird geprüft, ob die IP-Adresse, MAC-Adresse oder der Hostname bereits existieren.
+> Hinweis: IPManager liefert PXE Assets per HTTP aus (`/pxe-assets/*`). Der iPXE-Bootloader selbst wird typischerweise per TFTP verteilt (BIOS/UEFI), danach lädt iPXE das Menü via HTTP.
 
 ---
 
-## **Tests**
+## Setup: Datenbank & Migrationen
 
-### **Unit-Tests**
+1. Datenbank anlegen (Beispiel):
+   ```bash
+   createdb ipmanager
+````
 
-* **IP- und MAC-Validierung:** Alle Validierungsfunktionen für IP- und MAC-Adressen werden mit verschiedenen gültigen und ungültigen Werten getestet.
-* **Duplicate-Check:** Sicherstellung, dass Duplikate bei der Host-Erstellung oder -Aktualisierung korrekt erkannt und abgelehnt werden.
+2. `DATABASE_URL` setzen:
 
-### **Integrationstests**
+   ```bash
+   export DATABASE_URL="postgres://user:pass@localhost:5432/ipmanager"
+   ```
 
-* **Datenbank-Integration:** Die Integrationstests prüfen, ob Daten korrekt in der PostgreSQL-Datenbank gespeichert und abgerufen werden. Sie testen auch, ob Duplikate und falsche Fremdschlüsselverletzungen richtig behandelt werden.
-* **Transaktionen:** Jeder Test läuft in einer Transaktion, die nach dem Test zurückgerollt wird, um die Datenbank in einen sauberen Zustand zu versetzen.
+3. Migrationen ausführen (je nach eurem Setup):
 
-### **Test-Befehl:**
+   * Wenn ihr `sqlx-cli` nutzt:
+
+     ```bash
+     cargo install sqlx-cli --no-default-features --features postgres
+     sqlx migrate run
+     ```
+   * Alternativ: über euer bestehendes Migrations-/Startskript.
+
+---
+
+## Build & Run
+
+### Development
+
+```bash
+cargo run
+```
+
+### Tests
 
 ```bash
 cargo test
 ```
 
+### Integrationstests (optional)
+
+Setze `TEST_DATABASE_URL` auf eine leere Test-DB; Migrationen werden automatisch ausgeführt, und jeder Test läuft in einer Transaktion mit Rollback.
+
+```bash
+export TEST_DATABASE_URL="postgres://user:pass@localhost:5432/ipmanager_test"
+cargo test
+```
+
 ---
 
-## **Fazit**
+## Web-UI: Hosts
 
-Das IP-Management-System ist ein robustes Werkzeug zur Verwaltung von Hosts, Subnetzen und DHCP-Pools in einer Netzwerkumgebung, die mit Kea DHCP und PostgreSQL integriert ist. Es bietet umfangreiche Funktionen für die IP-Adressen- und MAC-Adressen-Validierung, Duplikatprüfungen sowie eine nahtlose Integration mit dem Kea DHCP-Server.
+* Hosts werden mit IPv4 und MAC-Adresse verwaltet.
+* Validierungen:
 
-### **Nächste Schritte:**
+  * IPv4 muss gültig sein (IPv6 wird abgewiesen)
+  * MAC muss gültiges Format haben
+  * Duplicate-Check: Hostname/IP/MAC dürfen nicht bereits existieren
+* Zusätzlich wird geprüft, ob IP/Zuordnung zum Subnetz plausibel ist (je nach Implementierung im Projekt).
 
-* Bereitstellung in einer Produktionsumgebung.
-* Weiterführende Tests und Optimierungen für die Datenbankoperationen.
-* Dokumentation und Schulung für Benutzer des Systems.
+---
+
+## PXE/iPXE: Nutzung
+
+### 1) PXE aktivieren
+
+Setze in `.env` (oder Environment):
+
+```env
+PXE_ENABLED=true
+PXE_ROOT_DIR=/var/lib/ipmanager/pxe
+PXE_HTTP_BASE_URL=http://ipmanager:8080/pxe-assets
+PXE_TFTP_SERVER=192.168.1.10
+PXE_BIOS_BOOTFILE=undionly.kpxe
+PXE_UEFI_BOOTFILE=ipxe.efi
+```
+
+### 2) Dateien bereitstellen
+
+Lege Boot-Artefakte in `PXE_ROOT_DIR` ab. IPManager bietet diese Dateien per HTTP an:
+
+* URL: `http://<ipmanager>/pxe-assets/<relative-path>`
+
+Die PXE-Image-UI nutzt eine Dropdown-Liste dieser Dateien (sicherer Whitelist/Existenz-Check).
+
+### 3) PXE-Images im Web anlegen
+
+* Öffne: `/pxe/images`
+* Erstelle Einträge:
+
+  * **Linux**: Kernel-Pfad (Pflicht), optional Initrd, Cmdline
+  * **Chain**: URL (http/https)
+
+Validierung (serverseitig):
+
+* Name: `[A-Za-z0-9._-]`, nicht leer
+* `kind`: linux/chain
+* `arch`: any/bios/uefi
+* Linux: Pfade müssen relativ sein, ohne `..`, innerhalb `PXE_ROOT_DIR`, und existieren
+* Chain: `http://` oder `https://` Pflicht
+* Cmdline wird getrimmt; Zeilenumbrüche werden entfernt
+
+### 4) iPXE-Menü abrufen
+
+* Endpoint: `/boot.ipxe`
+* Liefert ein iPXE-Skript mit Menü:
+
+  * Local disk
+  * iPXE shell
+  * alle `enabled` PXE-Images aus DB
+
+### 5) Kea DHCP: PXE/iPXE Bootfile-Logik
+
+Wenn `PXE_ENABLED=true`, erzeugt der Kea-Generator globale `client-classes`:
+
+* `ipxe`:
+
+  * Match: Vendor-Class iPXE
+  * boot-file-name: `boot.ipxe` URL (HTTP)
+* `uefi_x64`:
+
+  * Match: `option[93].hex == 0x0009`
+  * next-server: `PXE_TFTP_SERVER`
+  * boot-file-name: `PXE_UEFI_BOOTFILE`
+* `bios`:
+
+  * Catch-all
+  * next-server: `PXE_TFTP_SERVER`
+  * boot-file-name: `PXE_BIOS_BOOTFILE`
+
+Wichtig:
+
+* Reihenfolge der Klassen ist so gesetzt, dass iPXE immer gewinnt, wenn iPXE bereits läuft.
+
+---
+
+## Beispiel: iPXE Menü-Ausschnitt
+
+Ein Beispiel-Ausschnitt aus `/boot.ipxe` (vereinfacht):
+
+```text
+#!ipxe
+menu IPManager PXE Boot Menu
+item local Local disk
+item shell iPXE shell
+item img1 Ubuntu Installer [any]
+item img2 Rescue Chain [any]
+choose selected || goto start
+
+:img1
+kernel http://ipmanager:8080/pxe-assets/vmlinuz ip=dhcp ...
+initrd http://ipmanager:8080/pxe-assets/initrd.img
+boot
+
+:img2
+chain https://example.org/rescue.ipxe
+```
+
+---
+
+## Security / Betriebshinweise
+
+* `SESSION_SECRET` muss in Produktion zufällig und ausreichend lang sein.
+* `PXE_ROOT_DIR` sollte restriktive Rechte haben (nur Leserechte für den Webprozess, soweit möglich).
+* Stelle sicher, dass `/pxe-assets` nur das ausliefert, was du ausliefern willst.
+* In produktiven Setups empfiehlt sich TLS (Reverse Proxy), insbesondere wenn du Chain-URLs oder Assets über HTTPS ausliefern willst.
+
+---
+
+## Troubleshooting
+
+### PXE-Menü erscheint nicht
+
+* Prüfe, ob `PXE_ENABLED=true` gesetzt ist
+* Prüfe, ob `/boot.ipxe` erreichbar ist
+* Prüfe Kea-Konfiguration: client-classes vorhanden?
+* Prüfe iPXE Vendor-Class:
+
+  * In iPXE sollte Vendor-Class „iPXE“ sein (damit die `ipxe` class greift)
+
+### Files nicht im Dropdown
+
+* Liegen die Dateien wirklich unter `PXE_ROOT_DIR`?
+* Sind die Pfade relativ und ohne `..`?
+* Sind die Dateiendungen/Filter in `list_pxe_files` passend?
+
+### Integrationstests laufen nicht
+
+* Setze `TEST_DATABASE_URL`
+* Stelle sicher, dass die DB leer/als Test-DB gedacht ist
+
+---
+
+## Lizenz
+
+Interne Nutzung / projektabhängig. (Falls gewünscht, hier eine Lizenz eintragen.)
+
+```
+::contentReference[oaicite:0]{index=0}
+```
