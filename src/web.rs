@@ -407,9 +407,10 @@ async fn is_authenticated(session: &Session) -> bool {
     }
 }
 
-async fn add_auth_context(ctx: &mut Context, session: &Session) {
+async fn add_auth_context(ctx: &mut Context, session: &Session, state: &AppState) {
     let authed = is_authenticated(session).await;
     ctx.insert("is_authenticated", &authed);
+    ctx.insert("pxe_enabled", &state.config.pxe_enabled);
 }
 
 async fn require_auth(session: &Session) -> Result<(), Response> {
@@ -507,13 +508,13 @@ async fn load_pxe_images(pool: &PgPool) -> Result<Vec<PxeImageOption>, ()> {
 
 async fn index(State(state): State<AppState>, session: Session) -> Response {
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     render(&state.templates, "index.html", ctx)
 }
 
 async fn login_page(State(state): State<AppState>, session: Session) -> Response {
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
 
     if is_authenticated(&session).await {
         return Redirect::to("/me").into_response();
@@ -538,7 +539,7 @@ async fn login_submit(
     let (hash, role) = match row {
         Ok(Some(v)) => v,
         Ok(None) => {
-            return render_login_error(&state.templates, &session, "Login fehlgeschlagen").await
+            return render_login_error(&state, &session, "Login fehlgeschlagen").await
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -553,7 +554,7 @@ async fn login_submit(
             }
             Redirect::to("/me").into_response()
         }
-        _ => render_login_error(&state.templates, &session, "Login fehlgeschlagen").await,
+        _ => render_login_error(&state, &session, "Login fehlgeschlagen").await,
     }
 }
 
@@ -579,7 +580,7 @@ async fn me_page(State(state): State<AppState>, session: Session) -> Response {
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("username", &username);
     ctx.insert("role", &role);
 
@@ -597,7 +598,7 @@ async fn dhcp_kea_page(State(state): State<AppState>, session: Session) -> Respo
         Ok(c) => c,
         Err(e) => {
             let mut ctx = Context::new();
-            add_auth_context(&mut ctx, &session).await;
+            add_auth_context(&mut ctx, &session, &state).await;
             ctx.insert(
                 "error",
                 &Some(format!("Config konnte nicht geladen werden: {e:#}")),
@@ -612,7 +613,7 @@ async fn dhcp_kea_page(State(state): State<AppState>, session: Session) -> Respo
         Ok(j) => j,
         Err(e) => {
             let mut ctx = Context::new();
-            add_auth_context(&mut ctx, &session).await;
+            add_auth_context(&mut ctx, &session, &state).await;
             ctx.insert("error", &Some(format!("Render fehlgeschlagen: {e:#}")));
             ctx.insert("kea_json", &"{}".to_string());
             ctx.insert("kea_reload_mode", &cfg.kea_reload_mode);
@@ -621,7 +622,7 @@ async fn dhcp_kea_page(State(state): State<AppState>, session: Session) -> Respo
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
     ctx.insert("kea_json", &kea_json);
     ctx.insert("kea_reload_mode", &cfg.kea_reload_mode);
@@ -648,7 +649,7 @@ async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Res
             tracing::error!(error = ?e, "kea deploy failed");
 
             let mut ctx = Context::new();
-            add_auth_context(&mut ctx, &session).await;
+            add_auth_context(&mut ctx, &session, &state).await;
             ctx.insert("error", &Some(format!("Deploy fehlgeschlagen: {e:#}")));
 
             let kea_json = dhcp_kea::render_dhcp4_config(&state.pool, &cfg)
@@ -666,7 +667,7 @@ async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Res
         .unwrap_or_else(|_| "{}".to_string());
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
     ctx.insert("kea_json", &kea_json);
     ctx.insert("kea_reload_mode", &cfg.kea_reload_mode);
@@ -784,7 +785,7 @@ async fn hosts_list(
         .collect();
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("hosts", &hosts);
     ctx.insert("q", &q);
 
@@ -835,7 +836,7 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
     ctx.insert("locations", &locations);
     ctx.insert("lan_outlets", &lan_outlets);
@@ -1168,7 +1169,7 @@ async fn host_show(
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("host", &host);
 
     render(&state.templates, "host_show.html", ctx)
@@ -1211,7 +1212,7 @@ async fn host_edit(
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
     ctx.insert("host", &host);
     ctx.insert("locations", &locations);
@@ -1559,7 +1560,7 @@ async fn locations_list(State(state): State<AppState>, session: Session) -> Resp
         .collect();
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("locations", &locations);
 
     render(&state.templates, "locations_list.html", ctx)
@@ -1571,7 +1572,7 @@ async fn locations_new(State(state): State<AppState>, session: Session) -> Respo
     }
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
 
     render(&state.templates, "locations_new.html", ctx)
@@ -1616,7 +1617,7 @@ async fn locations_create(
 
 async fn render_locations_new_error(state: &AppState, session: &Session, msg: &str) -> Response {
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
     render(&state.templates, "locations_new.html", ctx)
 }
@@ -1651,7 +1652,7 @@ async fn lan_outlets_list(State(state): State<AppState>, session: Session) -> Re
         .collect();
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("lan_outlets", &lan_outlets);
 
     render(&state.templates, "lan_outlets_list.html", ctx)
@@ -1668,7 +1669,7 @@ async fn lan_outlets_new(State(state): State<AppState>, session: Session) -> Res
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
     ctx.insert("locations", &locations);
 
@@ -1738,7 +1739,7 @@ async fn render_lan_outlets_new_error(state: &AppState, session: &Session, msg: 
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
     ctx.insert("locations", &locations);
     render(&state.templates, "lan_outlets_new.html", ctx)
@@ -1809,7 +1810,7 @@ async fn subnets_list(State(state): State<AppState>, session: Session) -> Respon
         .collect();
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("subnets", &subnets);
 
     render(&state.templates, "subnets_list.html", ctx)
@@ -1821,7 +1822,7 @@ async fn subnets_new(State(state): State<AppState>, session: Session) -> Respons
     }
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
 
     render(&state.templates, "subnets_new.html", ctx)
@@ -1990,7 +1991,7 @@ async fn subnets_edit(
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
     ctx.insert("subnet", &subnet);
     render(&state.templates, "subnets_edit.html", ctx)
@@ -2146,7 +2147,7 @@ async fn render_subnets_edit_error(
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
     ctx.insert("subnet", &subnet);
     render(&state.templates, "subnets_edit.html", ctx)
@@ -2154,7 +2155,7 @@ async fn render_subnets_edit_error(
 
 async fn render_subnets_new_error(state: &AppState, session: &Session, msg: &str) -> Response {
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
     render(&state.templates, "subnets_new.html", ctx)
 }
@@ -2661,7 +2662,7 @@ async fn pxe_images_list(State(state): State<AppState>, session: Session) -> Res
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("images", &images);
     ctx.insert("pxe_enabled", &state.config.pxe_enabled);
     render(&state.templates, "pxe_images_list.html", ctx)
@@ -2678,7 +2679,7 @@ async fn pxe_images_new(State(state): State<AppState>, session: Session) -> Resp
     let files = list_pxe_files(StdPath::new(&state.config.pxe_root_dir));
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
     ctx.insert("files", &files);
     ctx.insert(
@@ -2744,7 +2745,7 @@ async fn pxe_images_edit(
     let files = list_pxe_files(StdPath::new(&state.config.pxe_root_dir));
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, &session).await;
+    add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
     ctx.insert("files", &files);
     ctx.insert("image", &image);
@@ -2821,11 +2822,11 @@ fn render_error_page(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-async fn render_login_error(tera: &Tera, session: &Session, msg: &str) -> Response {
+async fn render_login_error(state: &AppState, session: &Session, msg: &str) -> Response {
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
-    render(tera, "login.html", ctx)
+    render(&state.templates, "login.html", ctx)
 }
 
 async fn render_hosts_new_error(
@@ -2871,7 +2872,7 @@ async fn render_hosts_new_error(
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
     ctx.insert("locations", &locations);
     ctx.insert("lan_outlets", &lan_outlets);
@@ -2944,7 +2945,7 @@ async fn render_host_edit_error(
     };
 
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
     ctx.insert("host", &host);
     ctx.insert("locations", &locations);
@@ -2963,7 +2964,7 @@ async fn render_pxe_new_error(
     msg: &str,
 ) -> Response {
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
     ctx.insert("files", files);
     ctx.insert(
@@ -2992,7 +2993,7 @@ async fn render_pxe_edit_error(
     msg: &str,
 ) -> Response {
     let mut ctx = Context::new();
-    add_auth_context(&mut ctx, session).await;
+    add_auth_context(&mut ctx, session, state).await;
     ctx.insert("error", &Some(msg.to_string()));
     ctx.insert("files", files);
     ctx.insert(

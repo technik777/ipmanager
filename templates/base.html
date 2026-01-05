@@ -13,6 +13,9 @@
         <a href="/locations">Standorte</a>
         <a href="/lan-outlets">LAN-Dosen</a>
         <a href="/subnets">Subnets</a>
+        {% if pxe_enabled %}
+          <a href="/pxe/images">PXE Images</a>
+        {% endif %}
         <a href="/me">Me</a>
 
         {% if is_authenticated %}
