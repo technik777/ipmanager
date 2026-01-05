@@ -7,8 +7,8 @@
 
 <form method="get" action="/hosts" style="margin: 12px 0;">
   <label>
-    Suche (Hostname, IP, MAC, Standort, LAN-Dose):
-    <input name="q" value="{{ q | default(value="") }}" />
+    Suche (Hostname, IP, MAC, Standort, LAN-Dose, PXE-Image):
+    <input name="q" value="{{ q | default(value="") }}" placeholder="z.B. Hostname, IP oder PXE-Image" />
   </label>
   <button type="submit">Suchen</button>
   {% if q and q | length > 0 %}
@@ -28,6 +28,7 @@
         <th>Standort</th>
         <th>LAN-Dose</th>
         <th>PXE</th>
+        <th>PXE-Image</th>
         <th>Aktionen</th>
       </tr>
     </thead>
@@ -40,6 +41,7 @@
         <td>{{ h.location_name | default(value="") }}</td>
         <td>{{ h.lan_outlet_label | default(value="") }}</td>
         <td>{% if h.pxe_enabled %}ja{% else %}nein{% endif %}</td>
+        <td>{% if h.pxe_image_name %}{{ h.pxe_image_name }}{% else %}Kein PXE-Image{% endif %}</td>
         <td>
           <form method="post" action="/hosts/{{ h.id }}/delete" style="display:inline;" onsubmit="return confirm('Host wirklich löschen?');">
             <button type="submit">Löschen</button>

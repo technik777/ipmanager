@@ -21,7 +21,11 @@
 
   <label>
     IP (IPv4/IPv6)<br />
-    <input name="ip" required value="{{ host.ip }}" />
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <input name="ip" required value="{{ host.ip }}" />
+      <button type="button" id="find-free-ip-btn">Freie IP finden</button>
+      <span id="free-ip-result" style="color:#555;"></span>
+    </div>
   </label>
   <br /><br />
 
@@ -174,6 +178,43 @@
     outletSel.disabled = true;
     setOutletPlaceholder("Bitte zuerst Standort wählen…");
   }
+
+  // Freie IP suchen
+  const findBtn = document.getElementById("find-free-ip-btn");
+  const subnetSel = document.querySelector("select[name='subnet_id']");
+  const ipInput = document.querySelector("input[name='ip']");
+  const resultSpan = document.getElementById("free-ip-result");
+
+  async function findFreeIp() {
+    const subnetId = subnetSel.value;
+    if (!subnetId) {
+      resultSpan.textContent = "Bitte zuerst Subnet wählen.";
+      resultSpan.style.color = "#a33";
+      return;
+    }
+    resultSpan.textContent = "Suche freie IP...";
+    resultSpan.style.color = "#555";
+    try {
+      const res = await fetch(`/api/find-free-ip?subnet_id=${encodeURIComponent(subnetId)}`, {
+        headers: { "Accept": "application/json" }
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        resultSpan.textContent = text || "Keine freie IP gefunden.";
+        resultSpan.style.color = "#a33";
+        return;
+      }
+      const data = await res.json();
+      ipInput.value = data.free_ip;
+      resultSpan.textContent = `Freie IP: ${data.free_ip}`;
+      resultSpan.style.color = "#2d7a2d";
+    } catch (e) {
+      resultSpan.textContent = "Fehler beim Suchen.";
+      resultSpan.style.color = "#a33";
+    }
+  }
+
+  findBtn.addEventListener("click", findFreeIp);
 })();
 </script>
 

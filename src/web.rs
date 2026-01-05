@@ -9,7 +9,13 @@ use ipnetwork::IpNetwork;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::{net::Ipv4Addr, path::Path as StdPath, str::FromStr, sync::Arc};
+use std::{
+    collections::HashSet,
+    net::Ipv4Addr,
+    path::Path as StdPath,
+    str::FromStr,
+    sync::Arc,
+};
 use tera::{Context, Tera};
 use tower_sessions::Session;
 use uuid::Uuid;
@@ -48,6 +54,11 @@ pub struct LanOutletsQuery {
 pub struct LanOutletApiItem {
     pub id: String,
     pub label: String,
+}
+
+#[derive(Deserialize)]
+pub struct FindFreeIpQuery {
+    pub subnet_id: String,
 }
 
 /* ----------------------------- SSR (HTML) ----------------------------- */
@@ -145,6 +156,7 @@ struct HostRow {
     location_name: Option<String>,
     lan_outlet_label: Option<String>,
     pxe_enabled: bool,
+    pxe_image_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -216,7 +228,7 @@ struct SubnetRow {
     pxe_enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct PxeImage {
     id: i64,
     name: String,
@@ -284,7 +296,8 @@ pub fn router(state: AppState) -> Router {
         // API
         .route("/api/login", post(api_login))
         .route("/api/me", get(api_me))
-        .route("/api/lan-outlets", get(api_lan_outlets_by_location));
+        .route("/api/lan-outlets", get(api_lan_outlets_by_location))
+        .route("/api/find-free-ip", get(api_find_free_ip));
 
     if state.config.pxe_enabled {
         router = router
@@ -400,6 +413,10 @@ fn ensure_path_allowed(root: &StdPath, rel: &str) -> bool {
     }
 }
 
+fn ipv4_to_u32(ip: Ipv4Addr) -> u32 {
+    u32::from_be_bytes(ip.octets())
+}
+
 async fn is_authenticated(session: &Session) -> bool {
     match session.get::<String>("username").await {
         Ok(Some(_)) => true,
@@ -411,6 +428,88 @@ async fn add_auth_context(ctx: &mut Context, session: &Session, state: &AppState
     let authed = is_authenticated(session).await;
     ctx.insert("is_authenticated", &authed);
     ctx.insert("pxe_enabled", &state.config.pxe_enabled);
+}
+
+async fn get_dhcp_leases(_subnet_id: Uuid, _state: &AppState) -> Result<Vec<Ipv4Addr>, String> {
+    // TODO: Kea-API anbinden; bis dahin leere Liste (keine bekannten Leases)
+    tracing::debug!("get_dhcp_leases stub invoked; returning empty list");
+    Ok(Vec::new())
+}
+
+async fn find_free_ip(state: &AppState, subnet_id: Uuid) -> Result<Ipv4Addr, String> {
+    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "select cidr::text, host(dhcp_pool_start), host(dhcp_pool_end)
+         from subnets
+         where id = $1
+         limit 1",
+    )
+    .bind(subnet_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = ?e, %subnet_id, "failed loading subnet for find_free_ip");
+        "Subnet konnte nicht geladen werden".to_string()
+    })?;
+
+    let Some((cidr, pool_start, pool_end)) = row else {
+        return Err("Subnet nicht gefunden".to_string());
+    };
+
+    let net: ipnet::IpNet = cidr
+        .parse()
+        .map_err(|_| "Subnet CIDR ist ungültig".to_string())?;
+    let net = match net {
+        ipnet::IpNet::V4(v4) => v4,
+        ipnet::IpNet::V6(_) => return Err("IPv6 wird nicht unterstützt".to_string()),
+    };
+
+    let pool_start = match pool_start {
+        Some(s) => Some(s.parse::<Ipv4Addr>().map_err(|_| "DHCP Pool Start ungültig")?),
+        None => None,
+    };
+    let pool_end = match pool_end {
+        Some(s) => Some(s.parse::<Ipv4Addr>().map_err(|_| "DHCP Pool Ende ungültig")?),
+        None => None,
+    };
+
+    let taken_hosts: HashSet<Ipv4Addr> = sqlx::query_scalar::<_, String>(
+        "select host(ip) from hosts where subnet_id = $1",
+    )
+    .bind(subnet_id)
+    .fetch_all(&state.pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|s| s.parse::<Ipv4Addr>().ok())
+            .collect()
+    })
+    .unwrap_or_default();
+
+    let dhcp_leases = get_dhcp_leases(subnet_id, state).await.unwrap_or_default();
+    let mut taken_all: HashSet<Ipv4Addr> = taken_hosts;
+    taken_all.extend(dhcp_leases.into_iter());
+
+    let start_num = pool_start.map(ipv4_to_u32);
+    let end_num = pool_end.map(ipv4_to_u32);
+
+    for candidate in net.hosts() {
+        let c_num = ipv4_to_u32(candidate);
+        if let Some(s) = start_num {
+            if c_num < s {
+                continue;
+            }
+        }
+        if let Some(e) = end_num {
+            if c_num > e {
+                continue;
+            }
+        }
+        if !taken_all.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err("Keine freie IP im Subnet gefunden".to_string())
 }
 
 async fn require_auth(session: &Session) -> Result<(), Response> {
@@ -714,6 +813,7 @@ async fn hosts_list(
         Option<String>,
         Option<String>,
         bool,
+        Option<String>,
     )> = if q.is_empty() {
         match sqlx::query_as(
             "select h.id,
@@ -722,10 +822,12 @@ async fn hosts_list(
                         h.mac,
                         l.name as location_name,
                         o.label as lan_outlet_label,
-                        h.pxe_enabled
+                        h.pxe_enabled,
+                        pi.name as pxe_image_name
                  from hosts h
                  left join locations l on l.id = h.location_id
                  left join lan_outlets o on o.id = h.lan_outlet_id
+                 left join pxe_images pi on pi.id = h.pxe_image_id
                  order by h.hostname asc",
         )
         .fetch_all(&state.pool)
@@ -746,15 +848,18 @@ async fn hosts_list(
                         h.mac,
                         l.name as location_name,
                         o.label as lan_outlet_label,
-                        h.pxe_enabled
+                        h.pxe_enabled,
+                        pi.name as pxe_image_name
                  from hosts h
                  left join locations l on l.id = h.location_id
                  left join lan_outlets o on o.id = h.lan_outlet_id
+                 left join pxe_images pi on pi.id = h.pxe_image_id
                  where h.hostname ilike $1
                     or (h.ip::text) ilike $1
                     or h.mac ilike $1
                     or coalesce(l.name, '') ilike $1
                     or coalesce(o.label, '') ilike $1
+                    or coalesce(pi.name, '') ilike $1
                 order by h.hostname asc",
         )
         .bind(like)
@@ -772,7 +877,7 @@ async fn hosts_list(
     let hosts: Vec<HostRow> = rows
         .into_iter()
         .map(
-            |(id, hostname, ip, mac, location_name, lan_outlet_label, pxe_enabled)| HostRow {
+            |(id, hostname, ip, mac, location_name, lan_outlet_label, pxe_enabled, pxe_image_name)| HostRow {
                 id: id.to_string(),
                 hostname,
                 ip,
@@ -780,6 +885,7 @@ async fn hosts_list(
                 location_name,
                 lan_outlet_label,
                 pxe_enabled,
+                pxe_image_name,
             },
         )
         .collect();
@@ -842,6 +948,7 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
     ctx.insert("lan_outlets", &lan_outlets);
     ctx.insert("subnets", &subnets);
     ctx.insert("pxe_images", &pxe_images);
+    ctx.insert("suggested_ip", &Option::<String>::None);
     ctx.insert(
         "form",
         &serde_json::json!({
@@ -2243,6 +2350,29 @@ async fn api_lan_outlets_by_location(
     Ok(Json(items))
 }
 
+async fn api_find_free_ip(
+    State(state): State<AppState>,
+    session: Session,
+    Query(q): Query<FindFreeIpQuery>,
+) -> Response {
+    if let Err(resp) = require_auth_api(&session).await {
+        return resp.into_response();
+    }
+
+    let subnet_id = match Uuid::parse_str(q.subnet_id.trim()) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Ungültiges Subnet").into_response(),
+    };
+
+    match find_free_ip(&state, subnet_id).await {
+        Ok(ip) => Json(serde_json::json!({ "free_ip": ip.to_string() })).into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, subnet_id = %subnet_id, "find_free_ip failed");
+            (StatusCode::NOT_FOUND, e).into_response()
+        }
+    }
+}
+
 /* ----------------------------- PXE / iPXE ----------------------------- */
 
 fn validate_pxe_form(cfg: &Config, form: &PxeImageForm, files: &[String]) -> Result<ValidatedPxe, String> {
@@ -2648,7 +2778,11 @@ async fn boot_ipxe(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn pxe_images_list(State(state): State<AppState>, session: Session) -> Response {
+async fn pxe_images_list(
+    State(state): State<AppState>,
+    session: Session,
+    Query(q): Query<HostsQuery>,
+) -> Response {
     if let Err(resp) = require_auth(&session).await {
         return resp;
     }
@@ -2656,14 +2790,30 @@ async fn pxe_images_list(State(state): State<AppState>, session: Session) -> Res
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let search = q.q.unwrap_or_default();
     let images = match list_pxe_images(&state.pool).await {
         Ok(v) => v,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
+    let filtered = if search.trim().is_empty() {
+        images.clone()
+    } else {
+        let like = search.to_lowercase();
+        images
+            .into_iter()
+            .filter(|img| {
+                img.name.to_lowercase().contains(&like)
+                    || img.arch.to_lowercase().contains(&like)
+                    || img.kind.to_lowercase().contains(&like)
+            })
+            .collect::<Vec<_>>()
+    };
+
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, &session, &state).await;
-    ctx.insert("images", &images);
+    ctx.insert("images", &filtered);
+    ctx.insert("search_query", &search);
     ctx.insert("pxe_enabled", &state.config.pxe_enabled);
     render(&state.templates, "pxe_images_list.html", ctx)
 }
@@ -2878,6 +3028,12 @@ async fn render_hosts_new_error(
     ctx.insert("lan_outlets", &lan_outlets);
     ctx.insert("subnets", &subnets);
     ctx.insert("pxe_images", &pxe_images);
+    let suggested_ip = if let Ok(subnet_uuid) = Uuid::parse_str(form.subnet_id.trim()) {
+        find_free_ip(state, subnet_uuid).await.ok().map(|ip| ip.to_string())
+    } else {
+        None
+    };
+    ctx.insert("suggested_ip", &suggested_ip);
     ctx.insert(
         "form",
         &serde_json::json!({

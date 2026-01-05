@@ -9,6 +9,14 @@
     <a href="/pxe/images/new">Neu</a>
   </p>
 
+  <form method="get" action="/pxe/images" style="margin-bottom:12px;">
+    <input type="text" name="q" value="{{ search_query | default(value='') }}" placeholder="Suche nach Name/Typ/Architektur" />
+    <button type="submit">Suchen</button>
+    {% if search_query and search_query | length > 0 %}
+      <a href="/pxe/images" style="margin-left:8px;">Zurücksetzen</a>
+    {% endif %}
+  </form>
+
   <table border="1" cellpadding="6" cellspacing="0">
     <thead>
       <tr>
