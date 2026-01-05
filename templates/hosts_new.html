@@ -70,6 +70,23 @@
   </label>
   <br /><br />
 
+  <label>
+    PXE Image<br />
+    <select name="pxe_image_id" {% if pxe_images | length == 0 %}disabled{% endif %}>
+      <option value="" {% if not form.pxe_image_id %}selected{% endif %}>Kein PXE-Image</option>
+      {% for img in pxe_images %}
+        <option value="{{ img.id }}" {% if form.pxe_image_id == img.id %}selected{% endif %}>{{ img.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% if pxe_images | length == 0 %}
+    <div style="color:#a33; margin: 6px 0 12px 0;">
+      Keine PXE-Images vorhanden – bitte zuerst eines unter <a href="/pxe/images/new">PXE Images</a> anlegen.
+    </div>
+  {% else %}
+    <br /><br />
+  {% endif %}
+
   <button type="submit">Speichern</button>
 </form>
 

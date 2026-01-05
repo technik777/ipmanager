@@ -28,6 +28,7 @@
         <th>Standort</th>
         <th>LAN-Dose</th>
         <th>PXE</th>
+        <th>Aktionen</th>
       </tr>
     </thead>
     <tbody>
@@ -39,6 +40,11 @@
         <td>{{ h.location_name | default(value="") }}</td>
         <td>{{ h.lan_outlet_label | default(value="") }}</td>
         <td>{% if h.pxe_enabled %}ja{% else %}nein{% endif %}</td>
+        <td>
+          <form method="post" action="/hosts/{{ h.id }}/delete" style="display:inline;" onsubmit="return confirm('Host wirklich löschen?');">
+            <button type="submit">Löschen</button>
+          </form>
+        </td>
       </tr>
       {% endfor %}
     </tbody>

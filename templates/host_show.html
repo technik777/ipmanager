@@ -6,6 +6,9 @@
 <p>
   <a href="/hosts">← Zurück</a>
   | <a href="/hosts/{{ host.id }}/edit">Bearbeiten</a>
+  | <form method="post" action="/hosts/{{ host.id }}/delete" style="display:inline;" onsubmit="return confirm('Host wirklich löschen?');">
+      <button type="submit">Löschen</button>
+    </form>
 </p>
 
 <table border="1" cellpadding="6" cellspacing="0">
@@ -17,5 +20,8 @@
   <tr><th>LAN-Dose</th><td>{{ host.lan_outlet_label | default(value="") }}</td></tr>
   <tr><th>Subnet</th><td>{{ host.subnet_display | default(value="") }}</td></tr>
   <tr><th>PXE</th><td>{% if host.pxe_enabled %}ja{% else %}nein{% endif %}</td></tr>
+  {% if host.pxe_image_name %}
+    <tr><th>PXE Image</th><td>{{ host.pxe_image_name }}</td></tr>
+  {% endif %}
 </table>
 {% endblock content %}

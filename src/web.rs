@@ -67,6 +67,7 @@ pub struct HostCreateForm {
     pub lan_outlet_id: String,
     pub subnet_id: String,
     pub pxe_enabled: Option<String>,
+    pub pxe_image_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +79,7 @@ pub struct HostUpdateForm {
     pub lan_outlet_id: String,
     pub subnet_id: String,
     pub pxe_enabled: Option<String>,
+    pub pxe_image_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -158,6 +160,8 @@ struct HostShow {
     lan_outlet_label: Option<String>,
     subnet_display: Option<String>,
     pxe_enabled: bool,
+    pxe_image_id: Option<String>,
+    pxe_image_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -191,6 +195,12 @@ struct SubnetOption {
     id: String,
     name: String,
     cidr: String,
+}
+
+#[derive(Serialize)]
+struct PxeImageOption {
+    id: String,
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -253,6 +263,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts/new", get(hosts_new))
         .route("/hosts/{id}", get(host_show).post(host_update))
         .route("/hosts/{id}/edit", get(host_edit))
+        .route("/hosts/{id}/delete", post(host_delete))
         .route("/locations", get(locations_list).post(locations_create))
         .route("/locations/new", get(locations_new))
         .route(
@@ -282,7 +293,7 @@ pub fn router(state: AppState) -> Router {
             .route("/pxe/images/{id}/edit", get(pxe_images_edit).post(pxe_images_update))
             .route("/pxe/images/{id}/delete", post(pxe_images_delete));
         router = router.route_service(
-            "/pxe-assets/*path",
+            "/pxe-assets/{*path}",
             get_service(ServeDir::new(state.config.pxe_root_dir.clone())),
         );
     }
@@ -313,33 +324,36 @@ fn validate_mac(mac: &str) -> Result<MacAddr, String> {
 #[allow(dead_code)]
 fn list_pxe_files(root_dir: &StdPath) -> Vec<String> {
     let allowed_ext = [
-        "ipxe", "efi", "kpxe", "pxe", "vmlinuz", "img", "gz", "xz", "iso",
+        "ipxe", "efi", "kpxe", "pxe", "vmlinuz", "img", "gz", "xz", "iso", "wim",
     ];
 
-    let Ok(read_dir) = std::fs::read_dir(root_dir) else {
-        return Vec::new();
-    };
-
     let mut files = Vec::new();
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            continue;
-        }
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if !allowed_ext.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
-                continue;
-            }
-        } else {
-            continue;
-        }
+    let mut stack = vec![root_dir.to_path_buf()];
 
-        if let Ok(rel) = path.strip_prefix(root_dir) {
-            if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    while let Some(dir) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
                 continue;
             }
-            if let Some(s) = rel.to_str() {
-                files.push(s.replace('\\', "/"));
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if !allowed_ext.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
+                    continue;
+                }
+            }
+
+            if let Ok(rel) = path.strip_prefix(root_dir) {
+                if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    continue;
+                }
+                if let Some(s) = rel.to_str() {
+                    files.push(s.replace('\\', "/"));
+                }
             }
         }
     }
@@ -465,6 +479,26 @@ async fn load_subnets(pool: &PgPool) -> Result<Vec<SubnetOption>, ()> {
             id: id.to_string(),
             name,
             cidr,
+        })
+        .collect())
+}
+
+async fn load_pxe_images(pool: &PgPool) -> Result<Vec<PxeImageOption>, ()> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "select id, name
+         from pxe_images
+         where enabled = true
+         order by name asc",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| ())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, name)| PxeImageOption {
+            id: id.to_string(),
+            name,
         })
         .collect())
 }
@@ -785,6 +819,20 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
             return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Subnets");
         }
     };
+    let pxe_images = if state.config.pxe_enabled {
+        match load_pxe_images(&state.pool).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = ?e, "DB error in hosts_new loading pxe images");
+                return render_error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DB Fehler beim Laden der PXE Images",
+                );
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, &session).await;
@@ -792,6 +840,7 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
     ctx.insert("locations", &locations);
     ctx.insert("lan_outlets", &lan_outlets);
     ctx.insert("subnets", &subnets);
+    ctx.insert("pxe_images", &pxe_images);
     ctx.insert(
         "form",
         &serde_json::json!({
@@ -801,7 +850,8 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
             "location_id": "",
             "lan_outlet_id": "",
             "subnet_id": "",
-            "pxe_enabled": false
+            "pxe_enabled": false,
+            "pxe_image_id": ""
         }),
     );
 
@@ -925,6 +975,44 @@ async fn hosts_create(
         .await;
     }
 
+    let pxe_image_id = match form
+        .pxe_image_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => match v.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return render_hosts_new_error(&state, &session, &form, "Ungültiges PXE Image").await
+            }
+        },
+        None => None,
+    };
+
+    if let Some(img_id) = pxe_image_id {
+        let exists: Option<i32> = match sqlx::query_scalar(
+            "select 1 from pxe_images where id = $1 and enabled = true",
+        )
+        .bind(img_id)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = ?e, "DB error checking pxe_image_id on host create");
+                return render_error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DB Fehler beim Prüfen des PXE Images",
+                );
+            }
+        };
+
+        if exists.is_none() {
+            return render_hosts_new_error(&state, &session, &form, "Ungültiges PXE Image").await;
+        }
+    }
+
     tracing::debug!(
         hostname = %hostname,
         ip = %ip,
@@ -933,12 +1021,13 @@ async fn hosts_create(
         lan_outlet_id = %lan_outlet_id,
         subnet_id = %subnet_id,
         pxe_enabled,
+        pxe_image_id,
         "Attempting to insert host"
     );
 
     let res = sqlx::query(
-        "insert into hosts (hostname, ip, mac, location_id, lan_outlet_id, subnet_id, pxe_enabled)
-         values ($1, $2::inet, $3, $4, $5, $6, $7)",
+        "insert into hosts (hostname, ip, mac, location_id, lan_outlet_id, subnet_id, pxe_enabled, pxe_image_id)
+         values ($1, $2::inet, $3, $4, $5, $6, $7, $8)",
     )
     .bind(&hostname)
     .bind(ip.to_string())
@@ -947,6 +1036,7 @@ async fn hosts_create(
     .bind(lan_outlet_id)
     .bind(subnet_id)
     .bind(pxe_enabled)
+    .bind(pxe_image_id)
     .execute(&state.pool)
     .await;
 
@@ -1010,6 +1100,8 @@ async fn host_show(
         Option<String>,
         Option<String>,
         bool,
+        Option<i64>,
+        Option<String>,
     )> = match sqlx::query_as(
         "select h.id,
                 h.hostname,
@@ -1021,11 +1113,14 @@ async fn host_show(
                 l.name as location_name,
                 o.label as lan_outlet_label,
                 (s.name || ' (' || s.cidr::text || ')') as subnet_display,
-                h.pxe_enabled
+                h.pxe_enabled,
+                h.pxe_image_id,
+                pi.name as pxe_image_name
          from hosts h
          left join locations l on l.id = h.location_id
          left join lan_outlets o on o.id = h.lan_outlet_id
          left join subnets s on s.id = h.subnet_id
+         left join pxe_images pi on pi.id = h.pxe_image_id
          where h.id = $1
          limit 1",
     )
@@ -1049,6 +1144,8 @@ async fn host_show(
         lan_outlet_label,
         subnet_display,
         pxe_enabled,
+        pxe_image_id,
+        pxe_image_name,
     )) = row
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1066,6 +1163,8 @@ async fn host_show(
         lan_outlet_label,
         subnet_display,
         pxe_enabled,
+        pxe_image_id: pxe_image_id.map(|id| id.to_string()),
+        pxe_image_name,
     };
 
     let mut ctx = Context::new();
@@ -1102,6 +1201,14 @@ async fn host_edit(
         Ok(v) => v,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let pxe_images = if state.config.pxe_enabled {
+        match load_pxe_images(&state.pool).await {
+            Ok(v) => v,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        Vec::new()
+    };
 
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, &session).await;
@@ -1110,6 +1217,7 @@ async fn host_edit(
     ctx.insert("locations", &locations);
     ctx.insert("lan_outlets", &lan_outlets);
     ctx.insert("subnets", &subnets);
+    ctx.insert("pxe_images", &pxe_images);
 
     render(&state.templates, "host_edit.html", ctx)
 }
@@ -1223,6 +1331,37 @@ async fn host_update(
 
     let pxe_enabled = form.pxe_enabled.is_some();
 
+    let pxe_image_id = match form
+        .pxe_image_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => match v.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return render_host_edit_error(&state, &session, id, &form, "Ungültiges PXE Image").await
+            }
+        },
+        None => None,
+    };
+
+    if let Some(img_id) = pxe_image_id {
+        let exists: Option<i32> =
+            match sqlx::query_scalar("select 1 from pxe_images where id = $1 and enabled = true")
+                .bind(img_id)
+                .fetch_optional(&state.pool)
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+
+        if exists.is_none() {
+            return render_host_edit_error(&state, &session, id, &form, "Ungültiges PXE Image").await;
+        }
+    }
+
     let ok_pair: Option<i32> =
         match sqlx::query_scalar("select 1 from lan_outlets where id = $1 and location_id = $2")
             .bind(lan_outlet_id)
@@ -1253,8 +1392,9 @@ async fn host_update(
              location_id = $4,
              lan_outlet_id = $5,
              subnet_id = $6,
-             pxe_enabled = $7
-         where id = $8",
+             pxe_enabled = $7,
+             pxe_image_id = $8
+         where id = $9",
     )
     .bind(&hostname)
     .bind(ip.to_string())
@@ -1263,6 +1403,7 @@ async fn host_update(
     .bind(lan_outlet_id)
     .bind(subnet_id)
     .bind(pxe_enabled)
+    .bind(pxe_image_id)
     .bind(id)
     .execute(&state.pool)
     .await;
@@ -1293,6 +1434,35 @@ async fn host_update(
     }
 }
 
+async fn host_delete(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+
+    let res = sqlx::query("delete from hosts where id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await;
+
+    match res {
+        Ok(r) => {
+            if r.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                Redirect::to("/hosts").into_response()
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, host_id = %id, "failed to delete host");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>, ()> {
     let row: Option<(
         Uuid,
@@ -1306,6 +1476,8 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
         Option<String>,
         Option<String>,
         bool,
+        Option<i64>,
+        Option<String>,
     )> = sqlx::query_as(
         "select h.id,
                 h.hostname,
@@ -1317,11 +1489,14 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
                 l.name as location_name,
                 o.label as lan_outlet_label,
                 (s.name || ' (' || s.cidr::text || ')') as subnet_display,
-                h.pxe_enabled
+                h.pxe_enabled,
+                h.pxe_image_id,
+                pi.name as pxe_image_name
          from hosts h
          left join locations l on l.id = h.location_id
          left join lan_outlets o on o.id = h.lan_outlet_id
          left join subnets s on s.id = h.subnet_id
+         left join pxe_images pi on pi.id = h.pxe_image_id
          where h.id = $1
          limit 1",
     )
@@ -1343,6 +1518,8 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
             lan_outlet_label,
             subnet_display,
             pxe_enabled,
+            pxe_image_id,
+            pxe_image_name,
         )| HostShow {
             id: hid.to_string(),
             hostname,
@@ -1355,6 +1532,8 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
             lan_outlet_label,
             subnet_display,
             pxe_enabled,
+            pxe_image_id: pxe_image_id.map(|id| id.to_string()),
+            pxe_image_name,
         },
     ))
 }
@@ -2676,6 +2855,20 @@ async fn render_hosts_new_error(
             return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Subnets");
         }
     };
+    let pxe_images = if state.config.pxe_enabled {
+        match load_pxe_images(&state.pool).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = ?e, "DB error in render_hosts_new_error pxe_images");
+                return render_error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DB Fehler beim Laden der PXE Images",
+                );
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, session).await;
@@ -2683,6 +2876,7 @@ async fn render_hosts_new_error(
     ctx.insert("locations", &locations);
     ctx.insert("lan_outlets", &lan_outlets);
     ctx.insert("subnets", &subnets);
+    ctx.insert("pxe_images", &pxe_images);
     ctx.insert(
         "form",
         &serde_json::json!({
@@ -2692,7 +2886,8 @@ async fn render_hosts_new_error(
             "location_id": form.location_id.trim(),
             "lan_outlet_id": form.lan_outlet_id.trim(),
             "subnet_id": form.subnet_id.trim(),
-            "pxe_enabled": form.pxe_enabled.is_some()
+            "pxe_enabled": form.pxe_enabled.is_some(),
+            "pxe_image_id": form.pxe_image_id.as_deref().unwrap_or("").trim()
         }),
     );
 
@@ -2718,6 +2913,14 @@ async fn render_host_edit_error(
         Ok(v) => v,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let pxe_images = if state.config.pxe_enabled {
+        match load_pxe_images(&state.pool).await {
+            Ok(v) => v,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        Vec::new()
+    };
 
     let host = HostShow {
         id: id.to_string(),
@@ -2731,6 +2934,13 @@ async fn render_host_edit_error(
         lan_outlet_label: None,
         subnet_display: None,
         pxe_enabled: form.pxe_enabled.is_some(),
+        pxe_image_id: form
+            .pxe_image_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        pxe_image_name: None,
     };
 
     let mut ctx = Context::new();
@@ -2740,6 +2950,7 @@ async fn render_host_edit_error(
     ctx.insert("locations", &locations);
     ctx.insert("lan_outlets", &lan_outlets);
     ctx.insert("subnets", &subnets);
+    ctx.insert("pxe_images", &pxe_images);
 
     render(&state.templates, "host_edit.html", ctx)
 }
