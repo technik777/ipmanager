@@ -796,7 +796,6 @@ async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Res
 
 /* ----------------------------- Hosts (SSR) ----------------------------- */
 
-
 type HostsListRowDb = (
     Uuid,
     String,
@@ -1245,7 +1244,6 @@ async fn hosts_create(
     }
 }
 
-
 type HostShowRowDb = (
     Uuid,
     String,
@@ -1644,7 +1642,6 @@ async fn host_delete(
     }
 }
 
-
 type HostEditRowDb = (
     Uuid,
     String,
@@ -1929,7 +1926,6 @@ async fn render_lan_outlets_new_error(state: &AppState, session: &Session, msg: 
 }
 
 /* ----------------------------- Subnets (SSR) ----------------------------- */
-
 
 type SubnetsListRowDb = (
     Uuid,
@@ -2524,7 +2520,6 @@ fn validate_pxe_form(
         enabled,
     })
 }
-
 
 type PxeImagesListRowDb = (
     i64,
@@ -3249,7 +3244,6 @@ mod tests {
     use std::fs;
     use std::net::Ipv4Addr;
     use std::time::Duration;
-    use tempfile;
     use url::Url;
 
     #[test]
