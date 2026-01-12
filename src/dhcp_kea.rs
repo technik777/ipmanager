@@ -321,9 +321,19 @@ fn ipv4_usable_bounds(net: &ipnet::Ipv4Net) -> Result<(Ipv4Addr, Ipv4Addr)> {
 pub async fn deploy(pool: &PgPool, cfg: &Config) -> Result<DeployOutcome> {
     let json = render_dhcp4_config(pool, cfg).await?;
 
-    write_atomic(&cfg.kea_config_path, json.as_bytes()).context("failed to write kea config")?;
-
     let mode = cfg.kea_reload_mode.trim().to_lowercase();
+
+    if mode == "none" {
+        return Ok(DeployOutcome {
+            written_to: cfg.kea_config_path.clone(),
+            reload_attempted: false,
+            reload_ok: None,
+            reload_message: Some("KEA_RELOAD_MODE=none (no write, no reload)".to_string()),
+        });
+    }
+
+    // file | api → write config
+    write_atomic(&cfg.kea_config_path, json.as_bytes()).context("failed to write kea config")?;
 
     if mode == "api" {
         if cfg.kea_control_agent_url.is_none() {
@@ -339,6 +349,13 @@ pub async fn deploy(pool: &PgPool, cfg: &Config) -> Result<DeployOutcome> {
             reload_ok: Some(ok),
             reload_message: Some(msg),
         });
+    }
+
+    if mode != "file" {
+        return Err(anyhow!(
+            "invalid KEA_RELOAD_MODE={}: expected none|file|api",
+            cfg.kea_reload_mode
+        ));
     }
 
     Ok(DeployOutcome {
