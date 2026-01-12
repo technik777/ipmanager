@@ -5,17 +5,11 @@ use axum::{
     routing::{get, get_service, post},
     Json, Router,
 };
-use ipnetwork::IpNetwork;
 use ipnet::IpNet;
+use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::{
-    collections::HashSet,
-    net::Ipv4Addr,
-    path::Path as StdPath,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{collections::HashSet, net::Ipv4Addr, path::Path as StdPath, str::FromStr, sync::Arc};
 use tera::{Context, Tera};
 use tower_sessions::Session;
 use uuid::Uuid;
@@ -302,8 +296,14 @@ pub fn router(state: AppState) -> Router {
     if state.config.pxe_enabled {
         router = router
             .route("/pxe/images", get(pxe_images_list))
-            .route("/pxe/images/new", get(pxe_images_new).post(pxe_images_create))
-            .route("/pxe/images/{id}/edit", get(pxe_images_edit).post(pxe_images_update))
+            .route(
+                "/pxe/images/new",
+                get(pxe_images_new).post(pxe_images_create),
+            )
+            .route(
+                "/pxe/images/{id}/edit",
+                get(pxe_images_edit).post(pxe_images_update),
+            )
             .route("/pxe/images/{id}/delete", post(pxe_images_delete));
         router = router.route_service(
             "/pxe-assets/{*path}",
@@ -361,7 +361,10 @@ fn list_pxe_files(root_dir: &StdPath) -> Vec<String> {
             }
 
             if let Ok(rel) = path.strip_prefix(root_dir) {
-                if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                if rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
                     continue;
                 }
                 if let Some(s) = rel.to_str() {
@@ -399,7 +402,9 @@ fn valid_rel_path(p: &str) -> bool {
     !p.is_empty()
         && !path.is_absolute()
         && !p.starts_with('/')
-        && !path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 fn ensure_path_allowed(root: &StdPath, rel: &str) -> bool {
@@ -418,10 +423,7 @@ fn ipv4_to_u32(ip: Ipv4Addr) -> u32 {
 }
 
 async fn is_authenticated(session: &Session) -> bool {
-    match session.get::<String>("username").await {
-        Ok(Some(_)) => true,
-        _ => false,
-    }
+    matches!(session.get::<String>("username").await, Ok(Some(_)))
 }
 
 async fn add_auth_context(ctx: &mut Context, session: &Session, state: &AppState) {
@@ -464,26 +466,31 @@ async fn find_free_ip(state: &AppState, subnet_id: Uuid) -> Result<Ipv4Addr, Str
     };
 
     let pool_start = match pool_start {
-        Some(s) => Some(s.parse::<Ipv4Addr>().map_err(|_| "DHCP Pool Start ungültig")?),
+        Some(s) => Some(
+            s.parse::<Ipv4Addr>()
+                .map_err(|_| "DHCP Pool Start ungültig")?,
+        ),
         None => None,
     };
     let pool_end = match pool_end {
-        Some(s) => Some(s.parse::<Ipv4Addr>().map_err(|_| "DHCP Pool Ende ungültig")?),
+        Some(s) => Some(
+            s.parse::<Ipv4Addr>()
+                .map_err(|_| "DHCP Pool Ende ungültig")?,
+        ),
         None => None,
     };
 
-    let taken_hosts: HashSet<Ipv4Addr> = sqlx::query_scalar::<_, String>(
-        "select host(ip) from hosts where subnet_id = $1",
-    )
-    .bind(subnet_id)
-    .fetch_all(&state.pool)
-    .await
-    .map(|rows| {
-        rows.into_iter()
-            .filter_map(|s| s.parse::<Ipv4Addr>().ok())
-            .collect()
-    })
-    .unwrap_or_default();
+    let taken_hosts: HashSet<Ipv4Addr> =
+        sqlx::query_scalar::<_, String>("select host(ip) from hosts where subnet_id = $1")
+            .bind(subnet_id)
+            .fetch_all(&state.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|s| s.parse::<Ipv4Addr>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
 
     let dhcp_leases = get_dhcp_leases(subnet_id, state).await.unwrap_or_default();
     let mut taken_all: HashSet<Ipv4Addr> = taken_hosts;
@@ -637,9 +644,7 @@ async fn login_submit(
 
     let (hash, role) = match row {
         Ok(Some(v)) => v,
-        Ok(None) => {
-            return render_login_error(&state, &session, "Login fehlgeschlagen").await
-        }
+        Ok(None) => return render_login_error(&state, &session, "Login fehlgeschlagen").await,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
@@ -791,6 +796,18 @@ async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Res
 
 /* ----------------------------- Hosts (SSR) ----------------------------- */
 
+
+type HostsListRowDb = (
+    Uuid,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+);
+
 async fn hosts_list(
     State(state): State<AppState>,
     session: Session,
@@ -805,16 +822,7 @@ async fn hosts_list(
     let q_raw = query.q.clone().unwrap_or_default();
     let q = q_raw.trim().to_string();
 
-    let rows: Vec<(
-        Uuid,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        bool,
-        Option<String>,
-    )> = if q.is_empty() {
+    let rows: Vec<HostsListRowDb> = if q.is_empty() {
         match sqlx::query_as(
             "select h.id,
                         h.hostname,
@@ -836,7 +844,10 @@ async fn hosts_list(
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = ?e, "DB error in hosts_list");
-                return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Hosts");
+                return render_error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DB Fehler beim Laden der Hosts",
+                );
             }
         }
     } else {
@@ -869,7 +880,10 @@ async fn hosts_list(
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = ?e, "DB error in hosts_list (search)");
-                return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Hosts");
+                return render_error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DB Fehler beim Laden der Hosts",
+                );
             }
         }
     };
@@ -877,7 +891,16 @@ async fn hosts_list(
     let hosts: Vec<HostRow> = rows
         .into_iter()
         .map(
-            |(id, hostname, ip, mac, location_name, lan_outlet_label, pxe_enabled, pxe_image_name)| HostRow {
+            |(
+                id,
+                hostname,
+                ip,
+                mac,
+                location_name,
+                lan_outlet_label,
+                pxe_enabled,
+                pxe_image_name,
+            )| HostRow {
                 id: id.to_string(),
                 hostname,
                 ip,
@@ -909,21 +932,30 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "DB error in hosts_new loading locations");
-            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Standorte");
+            return render_error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB Fehler beim Laden der Standorte",
+            );
         }
     };
     let lan_outlets = match load_lan_outlets(&state.pool).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "DB error in hosts_new loading lan_outlets");
-            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der LAN-Dosen");
+            return render_error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB Fehler beim Laden der LAN-Dosen",
+            );
         }
     };
     let subnets = match load_subnets(&state.pool).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "DB error in hosts_new loading subnets");
-            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Subnets");
+            return render_error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB Fehler beim Laden der Subnets",
+            );
         }
     };
     let pxe_images = if state.config.pxe_enabled {
@@ -977,7 +1009,8 @@ async fn hosts_create(
 
     let hostname = form.hostname.trim().to_string();
     if hostname.is_empty() {
-        return render_hosts_new_error(&state, &session, &form, "Hostname darf nicht leer sein").await;
+        return render_hosts_new_error(&state, &session, &form, "Hostname darf nicht leer sein")
+            .await;
     }
 
     let ip: Ipv4Addr = match validate_ipv4(form.ip.trim()) {
@@ -993,56 +1026,76 @@ async fn hosts_create(
 
     let location_id: Uuid = match Uuid::parse_str(form.location_id.trim()) {
         Ok(v) => v,
-        Err(_) => return render_hosts_new_error(&state, &session, &form, "Ungültiger Standort").await,
+        Err(_) => {
+            return render_hosts_new_error(&state, &session, &form, "Ungültiger Standort").await
+        }
     };
 
     let lan_outlet_id: Uuid = match Uuid::parse_str(form.lan_outlet_id.trim()) {
         Ok(v) => v,
-        Err(_) => return render_hosts_new_error(&state, &session, &form, "Ungültige LAN-Dose").await,
+        Err(_) => {
+            return render_hosts_new_error(&state, &session, &form, "Ungültige LAN-Dose").await
+        }
     };
 
     let subnet_id: Uuid = match Uuid::parse_str(form.subnet_id.trim()) {
         Ok(v) => v,
-        Err(_) => return render_hosts_new_error(&state, &session, &form, "Ungültiges Subnet").await,
+        Err(_) => {
+            return render_hosts_new_error(&state, &session, &form, "Ungültiges Subnet").await
+        }
     };
 
     // IP muss im gewählten Subnet liegen
-    let cidr: Option<String> = match sqlx::query_scalar("select cidr::text from subnets where id = $1")
-        .bind(subnet_id)
-        .fetch_optional(&state.pool)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(error = ?e, "DB error in hosts_create loading subnet by id");
-            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden des Subnets");
-        }
-    };
+    let cidr: Option<String> =
+        match sqlx::query_scalar("select cidr::text from subnets where id = $1")
+            .bind(subnet_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = ?e, "DB error in hosts_create loading subnet by id");
+                return render_error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DB Fehler beim Laden des Subnets",
+                );
+            }
+        };
     let Some(cidr) = cidr else {
         return render_hosts_new_error(&state, &session, &form, "Ungültiges Subnet").await;
     };
     let net: ipnet::Ipv4Net = match cidr.parse() {
         Ok(n) => n,
-        Err(_) => return render_hosts_new_error(&state, &session, &form, "Subnet CIDR ist ungültig").await,
+        Err(_) => {
+            return render_hosts_new_error(&state, &session, &form, "Subnet CIDR ist ungültig")
+                .await
+        }
     };
     if !net.contains(&ip) {
-        return render_hosts_new_error(&state, &session, &form, "IP liegt nicht im gewählten Subnet").await;
+        return render_hosts_new_error(
+            &state,
+            &session,
+            &form,
+            "IP liegt nicht im gewählten Subnet",
+        )
+        .await;
     }
 
     // Vor dem Insert prüfen, ob Hostname/IP/MAC schon existieren
-    if let Ok(Some((conflict_host, conflict_ip, conflict_mac))) = sqlx::query_as::<_, (String, String, String)>(
-        "select hostname, host(ip), mac
+    if let Ok(Some((conflict_host, conflict_ip, conflict_mac))) =
+        sqlx::query_as::<_, (String, String, String)>(
+            "select hostname, host(ip), mac
          from hosts
          where hostname = $1
             or ip = $2::inet
             or mac = $3
          limit 1",
-    )
-    .bind(&hostname)
-    .bind(ip.to_string())
-    .bind(&mac_norm)
-    .fetch_optional(&state.pool)
-    .await
+        )
+        .bind(&hostname)
+        .bind(ip.to_string())
+        .bind(&mac_norm)
+        .fetch_optional(&state.pool)
+        .await
     {
         let msg = if conflict_host == hostname {
             "Hostname ist bereits vergeben"
@@ -1056,7 +1109,6 @@ async fn hosts_create(
         return render_hosts_new_error(&state, &session, &form, msg).await;
     }
 
-
     let pxe_enabled = form.pxe_enabled.is_some();
 
     let ok_pair: Option<i32> =
@@ -1069,7 +1121,10 @@ async fn hosts_create(
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = ?e, "DB error checking lan_outlet/location pair");
-                return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Prüfen der LAN-Dose");
+                return render_error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DB Fehler beim Prüfen der LAN-Dose",
+                );
             }
         };
 
@@ -1092,29 +1147,29 @@ async fn hosts_create(
         Some(v) => match v.parse::<i64>() {
             Ok(id) => Some(id),
             Err(_) => {
-                return render_hosts_new_error(&state, &session, &form, "Ungültiges PXE Image").await
+                return render_hosts_new_error(&state, &session, &form, "Ungültiges PXE Image")
+                    .await
             }
         },
         None => None,
     };
 
     if let Some(img_id) = pxe_image_id {
-        let exists: Option<i32> = match sqlx::query_scalar(
-            "select 1 from pxe_images where id = $1 and enabled = true",
-        )
-        .bind(img_id)
-        .fetch_optional(&state.pool)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = ?e, "DB error checking pxe_image_id on host create");
-                return render_error_page(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DB Fehler beim Prüfen des PXE Images",
-                );
-            }
-        };
+        let exists: Option<i32> =
+            match sqlx::query_scalar("select 1 from pxe_images where id = $1 and enabled = true")
+                .bind(img_id)
+                .fetch_optional(&state.pool)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = ?e, "DB error checking pxe_image_id on host create");
+                    return render_error_page(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "DB Fehler beim Prüfen des PXE Images",
+                    );
+                }
+            };
 
         if exists.is_none() {
             return render_hosts_new_error(&state, &session, &form, "Ungültiges PXE Image").await;
@@ -1150,7 +1205,10 @@ async fn hosts_create(
 
     match res {
         Ok(r) => {
-            tracing::debug!(rows_affected = r.rows_affected(), "Inserted host into database");
+            tracing::debug!(
+                rows_affected = r.rows_affected(),
+                "Inserted host into database"
+            );
             Redirect::to("/hosts").into_response()
         }
         Err(e) => {
@@ -1187,6 +1245,23 @@ async fn hosts_create(
     }
 }
 
+
+type HostShowRowDb = (
+    Uuid,
+    String,
+    String,
+    String,
+    Uuid,
+    Uuid,
+    Uuid,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<i64>,
+    Option<String>,
+);
+
 async fn host_show(
     State(state): State<AppState>,
     session: Session,
@@ -1196,21 +1271,7 @@ async fn host_show(
         return resp;
     }
 
-    let row: Option<(
-        Uuid,
-        String,
-        String,
-        String,
-        Uuid,
-        Uuid,
-        Uuid,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        bool,
-        Option<i64>,
-        Option<String>,
-    )> = match sqlx::query_as(
+    let row: Option<HostShowRowDb> = match sqlx::query_as(
         "select h.id,
                 h.hostname,
                 host(h.ip),
@@ -1388,25 +1449,35 @@ async fn host_update(
         }
     };
 
-
     // IP muss im gewählten Subnet liegen
-    let cidr: Option<String> = match sqlx::query_scalar("select cidr::text from subnets where id = $1")
-        .bind(subnet_id)
-        .fetch_optional(&state.pool)
-        .await
-    {
-        Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    let cidr: Option<String> =
+        match sqlx::query_scalar("select cidr::text from subnets where id = $1")
+            .bind(subnet_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
     let Some(cidr) = cidr else {
         return render_host_edit_error(&state, &session, id, &form, "Ungültiges Subnet").await;
     };
     let net: ipnet::Ipv4Net = match cidr.parse() {
         Ok(n) => n,
-        Err(_) => return render_host_edit_error(&state, &session, id, &form, "Subnet CIDR ist ungültig").await,
+        Err(_) => {
+            return render_host_edit_error(&state, &session, id, &form, "Subnet CIDR ist ungültig")
+                .await
+        }
     };
     if !net.contains(&ip) {
-        return render_host_edit_error(&state, &session, id, &form, "IP liegt nicht im gewählten Subnet").await;
+        return render_host_edit_error(
+            &state,
+            &session,
+            id,
+            &form,
+            "IP liegt nicht im gewählten Subnet",
+        )
+        .await;
     }
 
     // Vor dem Update prüfen, ob Hostname/IP/MAC schon existieren (anderer Datensatz)
@@ -1448,7 +1519,8 @@ async fn host_update(
         Some(v) => match v.parse::<i64>() {
             Ok(id) => Some(id),
             Err(_) => {
-                return render_host_edit_error(&state, &session, id, &form, "Ungültiges PXE Image").await
+                return render_host_edit_error(&state, &session, id, &form, "Ungültiges PXE Image")
+                    .await
             }
         },
         None => None,
@@ -1466,7 +1538,8 @@ async fn host_update(
             };
 
         if exists.is_none() {
-            return render_host_edit_error(&state, &session, id, &form, "Ungültiges PXE Image").await;
+            return render_host_edit_error(&state, &session, id, &form, "Ungültiges PXE Image")
+                .await;
         }
     }
 
@@ -1571,22 +1644,25 @@ async fn host_delete(
     }
 }
 
+
+type HostEditRowDb = (
+    Uuid,
+    String,
+    String,
+    String,
+    Uuid,
+    Uuid,
+    Uuid,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<i64>,
+    Option<String>,
+);
+
 async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>, ()> {
-    let row: Option<(
-        Uuid,
-        String,
-        String,
-        String,
-        Uuid,
-        Uuid,
-        Uuid,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        bool,
-        Option<i64>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let row: Option<HostEditRowDb> = sqlx::query_as(
         "select h.id,
                 h.hostname,
                 host(h.ip),
@@ -1854,22 +1930,25 @@ async fn render_lan_outlets_new_error(state: &AppState, session: &Session, msg: 
 
 /* ----------------------------- Subnets (SSR) ----------------------------- */
 
+
+type SubnetsListRowDb = (
+    Uuid,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
 async fn subnets_list(State(state): State<AppState>, session: Session) -> Response {
     if let Err(resp) = require_auth(&session).await {
         return resp;
     }
 
-    let rows: Vec<(
-        Uuid,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        bool,
-        Option<String>,
-        Option<String>,
-        bool,
-    )> = match sqlx::query_as(
+    let rows: Vec<SubnetsListRowDb> = match sqlx::query_as(
         "select id,
                 name,
                 cidr::text,
@@ -2038,17 +2117,7 @@ async fn subnets_edit(
         return resp;
     }
 
-    let row: Option<(
-        Uuid,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        bool,
-        Option<String>,
-        Option<String>,
-        bool,
-    )> = match sqlx::query_as(
+    let row: Option<SubnetsListRowDb> = match sqlx::query_as(
         "select id,
                 name,
                 cidr::text,
@@ -2375,7 +2444,11 @@ async fn api_find_free_ip(
 
 /* ----------------------------- PXE / iPXE ----------------------------- */
 
-fn validate_pxe_form(cfg: &Config, form: &PxeImageForm, files: &[String]) -> Result<ValidatedPxe, String> {
+fn validate_pxe_form(
+    cfg: &Config,
+    form: &PxeImageForm,
+    files: &[String],
+) -> Result<ValidatedPxe, String> {
     let name = form.name.trim();
     if !valid_name(name) {
         return Err("Name ist ungültig (erlaubt: A-Z, a-z, 0-9, ._- )".to_string());
@@ -2420,7 +2493,9 @@ fn validate_pxe_form(cfg: &Config, form: &PxeImageForm, files: &[String]) -> Res
     let root = StdPath::new(&cfg.pxe_root_dir);
 
     if kind == "linux" {
-        let kernel = kernel_path.clone().ok_or_else(|| "Kernel-Pfad ist erforderlich".to_string())?;
+        let kernel = kernel_path
+            .clone()
+            .ok_or_else(|| "Kernel-Pfad ist erforderlich".to_string())?;
         if !files.contains(&kernel) && !ensure_path_allowed(root, &kernel) {
             return Err("Kernel-Pfad ist ungültig oder existiert nicht".to_string());
         }
@@ -2430,7 +2505,9 @@ fn validate_pxe_form(cfg: &Config, form: &PxeImageForm, files: &[String]) -> Res
             }
         }
     } else if kind == "chain" {
-        let url = chain_url.clone().ok_or_else(|| "Chain-URL ist erforderlich".to_string())?;
+        let url = chain_url
+            .clone()
+            .ok_or_else(|| "Chain-URL ist erforderlich".to_string())?;
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err("Chain-URL muss mit http:// oder https:// beginnen".to_string());
         }
@@ -2448,21 +2525,21 @@ fn validate_pxe_form(cfg: &Config, form: &PxeImageForm, files: &[String]) -> Res
     })
 }
 
+
+type PxeImagesListRowDb = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
 async fn list_pxe_images(pool: &PgPool) -> Result<Vec<PxeImage>, ()> {
-    let rows: Result<
-        Vec<(
-            i64,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            bool,
-        )>,
-        _,
-    > = sqlx::query_as(
+    let rows: Result<Vec<PxeImagesListRowDb>, _> = sqlx::query_as(
         "select id,
                 name,
                 kind,
@@ -2481,16 +2558,18 @@ async fn list_pxe_images(pool: &PgPool) -> Result<Vec<PxeImage>, ()> {
     rows.map_err(|_| ()).map(|v| {
         v.into_iter()
             .map(
-                |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| PxeImage {
-                    id,
-                    name,
-                    kind,
-                    arch,
-                    kernel_path,
-                    initrd_path,
-                    chain_url,
-                    cmdline,
-                    enabled,
+                |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| {
+                    PxeImage {
+                        id,
+                        name,
+                        kind,
+                        arch,
+                        kernel_path,
+                        initrd_path,
+                        chain_url,
+                        cmdline,
+                        enabled,
+                    }
                 },
             )
             .collect()
@@ -2498,20 +2577,7 @@ async fn list_pxe_images(pool: &PgPool) -> Result<Vec<PxeImage>, ()> {
 }
 
 async fn get_pxe_image(pool: &PgPool, id: i64) -> Result<Option<PxeImage>, ()> {
-    let row: Result<
-        Option<(
-            i64,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            bool,
-        )>,
-        _,
-    > = sqlx::query_as(
+    let row: Result<Option<PxeImagesListRowDb>, _> = sqlx::query_as(
         "select id,
                 name,
                 kind,
@@ -2531,16 +2597,18 @@ async fn get_pxe_image(pool: &PgPool, id: i64) -> Result<Option<PxeImage>, ()> {
 
     row.map_err(|_| ()).map(|opt| {
         opt.map(
-            |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| PxeImage {
-                id,
-                name,
-                kind,
-                arch,
-                kernel_path,
-                initrd_path,
-                chain_url,
-                cmdline,
-                enabled,
+            |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| {
+                PxeImage {
+                    id,
+                    name,
+                    kind,
+                    arch,
+                    kernel_path,
+                    initrd_path,
+                    chain_url,
+                    cmdline,
+                    enabled,
+                }
             },
         )
     })
@@ -2713,20 +2781,7 @@ async fn boot_ipxe(State(state): State<AppState>) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let rows: Result<
-        Vec<(
-            i64,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            bool,
-        )>,
-        _,
-    > = sqlx::query_as(
+    let rows: Result<Vec<PxeImagesListRowDb>, _> = sqlx::query_as(
         "select id,
                 name,
                 kind,
@@ -2747,16 +2802,18 @@ async fn boot_ipxe(State(state): State<AppState>) -> Response {
         Ok(v) => v
             .into_iter()
             .map(
-                |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| PxeImage {
-                    id,
-                    name,
-                    kind,
-                    arch,
-                    kernel_path,
-                    initrd_path,
-                    chain_url,
-                    cmdline,
-                    enabled,
+                |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| {
+                    PxeImage {
+                        id,
+                        name,
+                        kind,
+                        arch,
+                        kernel_path,
+                        initrd_path,
+                        chain_url,
+                        cmdline,
+                        enabled,
+                    }
                 },
             )
             .collect::<Vec<_>>(),
@@ -2989,21 +3046,30 @@ async fn render_hosts_new_error(
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "DB error in render_hosts_new_error locations");
-            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Standorte");
+            return render_error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB Fehler beim Laden der Standorte",
+            );
         }
     };
     let lan_outlets = match load_lan_outlets(&state.pool).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "DB error in render_hosts_new_error lan_outlets");
-            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der LAN-Dosen");
+            return render_error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB Fehler beim Laden der LAN-Dosen",
+            );
         }
     };
     let subnets = match load_subnets(&state.pool).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "DB error in render_hosts_new_error subnets");
-            return render_error_page(StatusCode::INTERNAL_SERVER_ERROR, "DB Fehler beim Laden der Subnets");
+            return render_error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB Fehler beim Laden der Subnets",
+            );
         }
     };
     let pxe_images = if state.config.pxe_enabled {
@@ -3029,7 +3095,10 @@ async fn render_hosts_new_error(
     ctx.insert("subnets", &subnets);
     ctx.insert("pxe_images", &pxe_images);
     let suggested_ip = if let Ok(subnet_uuid) = Uuid::parse_str(form.subnet_id.trim()) {
-        find_free_ip(state, subnet_uuid).await.ok().map(|ip| ip.to_string())
+        find_free_ip(state, subnet_uuid)
+            .await
+            .ok()
+            .map(|ip| ip.to_string())
     } else {
         None
     };
@@ -3176,12 +3245,12 @@ mod tests {
         build_ipxe_script, ensure_path_allowed, validate_ipv4, validate_mac, validate_pxe_form,
         PxeImage, PxeImageForm,
     };
-    use std::net::Ipv4Addr;
-    use url::Url;
     use crate::config::Config;
-    use std::time::Duration;
     use std::fs;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
     use tempfile;
+    use url::Url;
 
     #[test]
     fn validate_ipv4_accepts_plain_address() {
@@ -3286,7 +3355,10 @@ mod tests {
         assert_eq!(validated.name, "test-linux");
         assert_eq!(validated.kernel_path.as_deref(), Some("vmlinuz"));
         assert_eq!(validated.initrd_path.as_deref(), Some("initrd.img"));
-        assert_eq!(validated.cmdline.as_deref(), Some("console=ttyS0 root=/dev/sda1"));
+        assert_eq!(
+            validated.cmdline.as_deref(),
+            Some("console=ttyS0 root=/dev/sda1")
+        );
         assert!(validated.enabled);
     }
 

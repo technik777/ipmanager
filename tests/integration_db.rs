@@ -29,12 +29,13 @@ async fn host_duplicate_is_rejected() -> anyhow::Result<()> {
 
     let mut tx = pool.begin().await?;
 
-    let subnet_id: Uuid = sqlx::query("insert into subnets (name, cidr) values ($1, $2) returning id")
-        .bind("s-integration")
-        .bind("192.0.2.0/24")
-        .map(|row: sqlx::postgres::PgRow| row.get(0))
-        .fetch_one(&mut *tx)
-        .await?;
+    let subnet_id: Uuid =
+        sqlx::query("insert into subnets (name, cidr) values ($1, $2) returning id")
+            .bind("s-integration")
+            .bind("192.0.2.0/24")
+            .map(|row: sqlx::postgres::PgRow| row.get(0))
+            .fetch_one(&mut *tx)
+            .await?;
 
     sqlx::query("insert into hosts (hostname, ip, mac, subnet_id) values ($1, $2, $3, $4)")
         .bind("host-a")
@@ -44,14 +45,15 @@ async fn host_duplicate_is_rejected() -> anyhow::Result<()> {
         .execute(&mut *tx)
         .await?;
 
-    let err = sqlx::query("insert into hosts (hostname, ip, mac, subnet_id) values ($1, $2, $3, $4)")
-        .bind("host-a") // duplicate hostname
-        .bind("192.0.2.11")
-        .bind("aa:bb:cc:dd:ee:02")
-        .bind(subnet_id)
-        .execute(&mut *tx)
-        .await
-        .expect_err("duplicate hostname should fail");
+    let err =
+        sqlx::query("insert into hosts (hostname, ip, mac, subnet_id) values ($1, $2, $3, $4)")
+            .bind("host-a") // duplicate hostname
+            .bind("192.0.2.11")
+            .bind("aa:bb:cc:dd:ee:02")
+            .bind(subnet_id)
+            .execute(&mut *tx)
+            .await
+            .expect_err("duplicate hostname should fail");
 
     let code = err
         .as_database_error()
@@ -73,14 +75,15 @@ async fn host_invalid_subnet_is_rejected() -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
     let bogus_subnet = Uuid::new_v4();
-    let err = sqlx::query("insert into hosts (hostname, ip, mac, subnet_id) values ($1, $2, $3, $4)")
-        .bind("host-bad-subnet")
-        .bind("192.0.2.50")
-        .bind("aa:bb:cc:dd:ee:03")
-        .bind(bogus_subnet)
-        .execute(&mut *tx)
-        .await
-        .expect_err("FK violation expected for missing subnet");
+    let err =
+        sqlx::query("insert into hosts (hostname, ip, mac, subnet_id) values ($1, $2, $3, $4)")
+            .bind("host-bad-subnet")
+            .bind("192.0.2.50")
+            .bind("aa:bb:cc:dd:ee:03")
+            .bind(bogus_subnet)
+            .execute(&mut *tx)
+            .await
+            .expect_err("FK violation expected for missing subnet");
 
     let code = err
         .as_database_error()
