@@ -65,8 +65,11 @@ impl Config {
 
         let pxe_enabled = env_bool("PXE_ENABLED").unwrap_or(false);
         let pxe_root_dir = env_default("PXE_ROOT_DIR", "/var/lib/ipmanager/pxe");
-        let pxe_http_base_url = Url::parse(&env_default("PXE_HTTP_BASE_URL", "http://127.0.0.1:3000/pxe-assets"))
-            .context("PXE_HTTP_BASE_URL must be a valid URL")?;
+        let pxe_http_base_url = Url::parse(&env_default(
+            "PXE_HTTP_BASE_URL",
+            "http://127.0.0.1:3000/pxe-assets",
+        ))
+        .context("PXE_HTTP_BASE_URL must be a valid URL")?;
         let pxe_tftp_server = env_default("PXE_TFTP_SERVER", "127.0.0.1");
         let pxe_bios_bootfile = env_default("PXE_BIOS_BOOTFILE", "undionly.kpxe");
         let pxe_uefi_bootfile = env_default("PXE_UEFI_BOOTFILE", "ipxe.efi");

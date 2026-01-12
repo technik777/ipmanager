@@ -59,10 +59,8 @@ impl FromStr for MacAddr {
         }
 
         let mut out = [0u8; 6];
-        let mut j = 0usize;
-        for i in (0..17).step_by(3) {
+        for (j, i) in (0..17).step_by(3).enumerate() {
             out[j] = MacAddr::parse_hex_pair(bytes[i], bytes[i + 1])?;
-            j += 1;
         }
         Ok(MacAddr(out))
     }

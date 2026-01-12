@@ -195,7 +195,7 @@ pub async fn render_dhcp4_config(pool: &PgPool, cfg: &Config) -> Result<String> 
         },
     };
 
-    Ok(serde_json::to_string_pretty(&root).context("failed to serialize kea config")?)
+    serde_json::to_string_pretty(&root).context("failed to serialize kea config")
 }
 
 fn pxe_client_classes(cfg: &Config) -> Option<Vec<ClientClass>> {
@@ -234,7 +234,7 @@ fn pxe_client_classes(cfg: &Config) -> Option<Vec<ClientClass>> {
 /// Determine the Kea pool range for a subnet:
 /// - If dhcp_pool_start/end are NULL: use default (first usable .. last usable).
 /// - If set: validate IPv4, within usable subnet bounds, start <= end.
-/// Any invalid range yields an error with context (no silent fallback).
+///   Any invalid range yields an error with context (no silent fallback).
 fn ipv4_pool_for_subnet(
     net: &ipnet::Ipv4Net,
     cidr: &str,
