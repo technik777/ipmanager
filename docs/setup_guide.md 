@@ -1,0 +1,124 @@
+# Setup Guide: SyncLogic IP-Manager
+
+Diese Anleitung beschreibt die Installation und Konfiguration der gesamten Infrastruktur für den `ipmanager`.
+
+## 1. System-Vorbereitung
+
+Zuerst aktualisieren wir das System und entfernen Reste von alten DHCP-Installationen (wie Kea), um Port-Konflikte zu vermeiden.
+
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt purge -y isc-kea* sudo apt autoremove -y
+
+```
+
+## 2. PostgreSQL Installation & Setup
+
+Der IP-Manager nutzt PostgreSQL als primäre Datenbank.
+
+### Installation
+
+```bash
+sudo apt install -y postgresql postgresql-contrib
+
+```
+
+### Datenbank und User anlegen
+
+Melde dich als Postgres-Admin an und erstelle die Umgebung für den Rust-Backend:
+
+```bash
+sudo -u postgres psql
+
+```
+
+Im SQL-Prompt:
+
+```sql
+CREATE DATABASE ipmanager_db;
+CREATE USER ipadmin WITH PASSWORD 'dein_sicheres_passwort';
+GRANT ALL PRIVILEGES ON DATABASE ipmanager_db TO ipadmin;
+-- Wichtig für Ubuntu 24.04: Zugriffsberechtigungen setzen
+ALTER DATABASE ipmanager_db OWNER TO ipadmin;
+\q
+
+```
+
+## 3. dnsmasq Installation & Konfiguration
+
+dnsmasq dient als DHCP-Server und liest die vom Backend generierten Dateien ein.
+
+### Installation
+
+```bash
+sudo apt install -y dnsmasq
+
+```
+
+### Basiskonfiguration
+
+Wir deaktivieren den Standard-DNS-Server von Ubuntu (systemd-resolved), falls dieser Port 53 blockiert, oder konfigurieren dnsmasq so, dass er nur als DHCP arbeitet.
+
+Editiere die Hauptkonfiguration: `sudo nano /etc/dnsmasq.conf`
+Stelle sicher, dass folgende Zeilen aktiv/vorhanden sind:
+
+```text
+# Schnittstelle, auf der dnsmasq lauschen soll
+interface=eth0  # Ersetze eth0 durch dein Interface
+
+# Wichtig: Lade zusätzliche Config-Dateien aus diesem Ordner
+conf-dir=/etc/dnsmasq.d/,*.conf
+
+# Deaktiviere DNS, falls nicht benötigt
+port=0
+
+```
+
+### Schreibrechte für Rust vergeben
+
+Damit das Rust-Backend die Host-Files schreiben kann, ohne Root-Rechte für den gesamten Prozess zu benötigen, erstellen wir eine dedizierte Datei:
+
+```bash
+sudo touch /etc/dnsmasq.d/01-rust-managed.conf
+sudo chown youruser:dnsmasq /etc/dnsmasq.d/01-rust-managed.conf
+sudo chmod 664 /etc/dnsmasq.d/01-rust-managed.conf
+
+```
+
+## 4. Rust Toolchain & Projekt-Setup
+
+Stelle sicher, dass Rust installiert ist:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+```
+
+### Umgebungsvariablen für SQLx
+
+Erstelle eine `.env` Datei im Root-Verzeichnis deines Projekts:
+
+```text
+DATABASE_URL=postgres://ipadmin:dein_sicheres_passwort@localhost/ipmanager_db
+
+```
+
+### Datenbank-Migrationen (optional mit sqlx-cli)
+
+```bash
+cargo install sqlx-cli --no-default-features --features postgres
+sqlx migrate run
+
+```
+
+## 5. Den Sync-Dienst starten
+
+Nachdem der Rust-Code kompiliert wurde (`cargo build --release`), kann der erste Test-Sync durchgeführt werden.
+
+### Automatischer Reload (Sudo-Berechtigung)
+
+Damit dein Rust-Backend dnsmasq neu starten darf, ohne nach einem Passwort zu fragen, füge eine Regel in `sudo visudo` hinzu:
+
+```text
+youruser ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart dnsmasq
