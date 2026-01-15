@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, Message, Tokio1Executor};
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::config::Config;
 
@@ -30,20 +30,21 @@ pub async fn send_admin_alert(cfg: &Config, subject: &str, body: &str) -> Result
     }
     let message = builder.body(body.to_string()).context("failed to build email")?;
 
-    let mut transport = if cfg.smtp_use_starttls {
+    let mut builder = if cfg.smtp_use_starttls {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
             .context("failed to create SMTP transport")?
     } else {
-        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host).build()
+        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
     };
 
     if let (Some(user), Some(pass)) = (cfg.smtp_username.as_deref(), cfg.smtp_password.as_deref()) {
-        transport = transport.credentials(Credentials::new(user.to_string(), pass.to_string()));
+        builder = builder.credentials(Credentials::new(user.to_string(), pass.to_string()));
     }
     if let Some(port) = cfg.smtp_port {
-        transport = transport.port(port);
+        builder = builder.port(port);
     }
 
+    let transport = builder.build();
     transport
         .send(message)
         .await

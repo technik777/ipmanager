@@ -42,6 +42,11 @@ pub struct Config {
     pub smtp_to: Vec<String>,
     pub smtp_use_starttls: bool,
 
+    // Macmon
+    pub macmon_base_url: Option<String>,
+    pub macmon_username: Option<String>,
+    pub macmon_password: Option<String>,
+
     // dnsmasq
     pub dnsmasq_hosts_file: String,
     pub dnsmasq_reload_cmd: String,
@@ -99,6 +104,10 @@ impl Config {
             .unwrap_or_default();
         let smtp_use_starttls = env_bool("SMTP_USE_STARTTLS").unwrap_or(true);
 
+        let macmon_base_url = env_optional("MACMON_BASE_URL");
+        let macmon_username = env_optional("MACMON_USERNAME");
+        let macmon_password = env_optional("MACMON_PASSWORD");
+
         // dnsmasq
         let dnsmasq_hosts_file =
             env_default("DNSMASQ_HOSTS_FILE", "/etc/dnsmasq.d/01-rust-hosts.conf");
@@ -139,6 +148,10 @@ impl Config {
             smtp_from,
             smtp_to,
             smtp_use_starttls,
+
+            macmon_base_url,
+            macmon_username,
+            macmon_password,
 
             // dnsmasq
             dnsmasq_hosts_file,

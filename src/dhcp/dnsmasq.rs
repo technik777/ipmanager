@@ -14,6 +14,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
 use crate::domain::mac::MacAddr;
+use crate::integrations::macmon;
 use crate::notifications::email;
 const DNSMASQ_GLOBAL_CONFIG_PATH: &str = "/etc/dnsmasq.d/00-global.conf";
 
@@ -171,6 +172,15 @@ pub async fn sync_dnsmasq_hosts(
         )
     })?;
     let mut writer = BufWriter::new(file);
+    writer
+        .write_all(b"dhcp-userclass=set:ipxe,iPXE\n")
+        .await?;
+    writer
+        .write_all(b"dhcp-boot=tag:!ipxe,ipxe.efi\n")
+        .await?;
+    writer
+        .write_all(b"dhcp-boot=tag:ipxe,boot.ipxe\n")
+        .await?;
 
     for host in &hosts {
         let mac = MacAddr::from_str(host.mac_address.trim()).with_context(|| {
@@ -378,6 +388,10 @@ Bitte pruefe die PXE-Images im TFTP-Root ({}).",
         if let Err(e) = email::send_admin_alert(config, subject, &body).await {
             tracing::error!(error = ?e, "failed to send orphaned PXE email alert");
         }
+    }
+
+    if let Err(e) = macmon::sync_new_hosts(pool, config).await {
+        tracing::error!(error = ?e, "macmon sync failed");
     }
 
     tracing::info!(

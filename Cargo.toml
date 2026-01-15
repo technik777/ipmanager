@@ -38,7 +38,8 @@ ipnetwork = "0.20"
 tera = "1.20"
 
 html-escape = "0.2"
-lettre = { version = "0.11", features = ["tokio1", "smtp-transport", "builder"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
