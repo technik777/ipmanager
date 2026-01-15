@@ -33,6 +33,15 @@ pub struct Config {
     pub pxe_bios_bootfile: String,
     pub pxe_uefi_bootfile: String,
 
+    // SMTP
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
+    pub smtp_from: Option<String>,
+    pub smtp_to: Vec<String>,
+    pub smtp_use_starttls: bool,
+
     // dnsmasq
     pub dnsmasq_hosts_file: String,
     pub dnsmasq_reload_cmd: String,
@@ -74,6 +83,22 @@ impl Config {
         let pxe_bios_bootfile = env_default("PXE_BIOS_BOOTFILE", "undionly.kpxe");
         let pxe_uefi_bootfile = env_default("PXE_UEFI_BOOTFILE", "ipxe.efi");
 
+        let smtp_host = env_optional("SMTP_HOST");
+        let smtp_port = env_u16("SMTP_PORT");
+        let smtp_username = env_optional("SMTP_USERNAME");
+        let smtp_password = env_optional("SMTP_PASSWORD");
+        let smtp_from = env_optional("SMTP_FROM");
+        let smtp_to = env_optional("SMTP_TO")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let smtp_use_starttls = env_bool("SMTP_USE_STARTTLS").unwrap_or(true);
+
         // dnsmasq
         let dnsmasq_hosts_file =
             env_default("DNSMASQ_HOSTS_FILE", "/etc/dnsmasq.d/01-rust-hosts.conf");
@@ -106,6 +131,14 @@ impl Config {
             pxe_tftp_server,
             pxe_bios_bootfile,
             pxe_uefi_bootfile,
+
+            smtp_host,
+            smtp_port,
+            smtp_username,
+            smtp_password,
+            smtp_from,
+            smtp_to,
+            smtp_use_starttls,
 
             // dnsmasq
             dnsmasq_hosts_file,

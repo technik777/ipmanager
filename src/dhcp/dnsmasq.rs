@@ -14,6 +14,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
 use crate::domain::mac::MacAddr;
+use crate::notifications::email;
 const DNSMASQ_GLOBAL_CONFIG_PATH: &str = "/etc/dnsmasq.d/00-global.conf";
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +135,7 @@ pub async fn sync_dnsmasq_hosts(
     let tftp_files = list_tftp_files(Path::new(&config.tftp_root_dir)).await;
     let tftp_set: HashSet<String> = tftp_files.into_iter().collect();
     let mut warnings = Vec::new();
+    let mut orphaned_count = 0usize;
 
     let hosts: Vec<HostRow> = match sqlx::query_as(
         "select h.id,
@@ -257,6 +259,7 @@ pub async fn sync_dnsmasq_hosts(
                 warnings.push(warning.clone());
                 tracing::warn!("{}", warning);
                 pxe_image = "undionly.kpxe";
+                orphaned_count += 1;
             }
         }
         writer
@@ -290,6 +293,15 @@ pub async fn sync_dnsmasq_hosts(
                     "dnsmasq --test failed"
                 );
                 update_last_test(status, false, Some(stderr.to_string())).await;
+                if let Err(e) = email::send_admin_alert(
+                    config,
+                    "ipmanager: dnsmasq --test fehlgeschlagen",
+                    &format!("dnsmasq --test ist fehlgeschlagen:\n{stderr}"),
+                )
+                .await
+                {
+                    tracing::error!(error = ?e, "failed to send dnsmasq test email alert");
+                }
                 return Err(anyhow::anyhow!("dnsmasq --test failed: {}", stderr));
             }
             update_last_test(status, true, None).await;
@@ -342,7 +354,7 @@ pub async fn sync_dnsmasq_hosts(
     let details: JsonValue = serde_json::json!({
         "hosts_updated": hosts.len(),
         "warnings_count": warnings_count,
-        "has_orphans": warnings_count > 0,
+        "has_orphans": orphaned_count > 0,
     });
     if let Err(e) = sqlx::query(
         "insert into audit_logs (user_id, action, details) values ($1, $2, $3)",
@@ -354,6 +366,18 @@ pub async fn sync_dnsmasq_hosts(
     .await
     {
         tracing::error!(error = ?e, "failed to write audit log for dnsmasq sync");
+    }
+
+    if orphaned_count > 0 {
+        let subject = "ipmanager: fehlende PXE-Dateien beim dnsmasq Sync";
+        let body = format!(
+            "Beim dnsmasq Sync wurden {orphaned_count} Hosts mit fehlenden PXE-Dateien festgestellt.\n\
+Bitte pruefe die PXE-Images im TFTP-Root ({}).",
+            config.tftp_root_dir
+        );
+        if let Err(e) = email::send_admin_alert(config, subject, &body).await {
+            tracing::error!(error = ?e, "failed to send orphaned PXE email alert");
+        }
     }
 
     tracing::info!(

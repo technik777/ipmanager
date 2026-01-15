@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod domain;
 pub mod dhcp;
+mod notifications;
 mod web;
 
 use anyhow::{Context, Result};
