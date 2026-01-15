@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use sqlx::{FromRow, PgPool};
 use tokio::process::Command;
 
+use crate::domain::mac::MacAddr;
 const DNSMASQ_GLOBAL_CONFIG_PATH: &str = "/etc/dnsmasq.d/00-global.conf";
 
 #[derive(Debug, FromRow)]
@@ -106,6 +107,7 @@ pub async fn sync_dnsmasq_hosts(pool: &PgPool, config: &crate::config::Config) -
     };
 
     let mut output = String::new();
+    output.push_str("dhcp-ignore=tag:!known_host\n");
     if config.pxe_enabled {
         let boot_url = format!(
             "{}/boot.ipxe",
@@ -119,10 +121,12 @@ pub async fn sync_dnsmasq_hosts(pool: &PgPool, config: &crate::config::Config) -
         output.push_str(&format!("tftp-root={}\n\n", config.pxe_root_dir));
     }
     for host in hosts {
-        let hostname = host.hostname.as_deref().unwrap_or("");
+        let mac = MacAddr::from_str(host.mac_address.trim()).with_context(|| {
+            format!("invalid mac_address in hosts table: {}", host.mac_address)
+        })?;
         output.push_str(&format!(
-            "dhcp-host={},{},{}\n",
-            host.mac_address, host.ip_address, hostname
+            "dhcp-host={},{},set:known_host\n",
+            mac, host.ip_address
         ));
     }
 
