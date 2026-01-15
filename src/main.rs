@@ -6,6 +6,7 @@ mod web;
 
 use anyhow::{Context, Result};
 use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::{Mutex, oneshot};
 use tera::Tera;
 use tower_sessions::{cookie::Key, SessionManagerLayer};
 use tower_sessions_sqlx_store::PostgresStore;
@@ -19,15 +20,26 @@ async fn main() -> Result<()> {
     let pool = db::connect(&cfg).await?;
     db::ensure_initial_admin(&cfg, &pool).await?;
 
-    dhcp::dnsmasq::sync_dnsmasq_hosts(&pool, &cfg)
-        .await
-        .expect("Initialer dnsmasq Sync fehlgeschlagen");
+    let dnsmasq_status = Arc::new(Mutex::new(dhcp::dnsmasq::DnsmasqStatus::default()));
+
+    if let Err(e) = dhcp::dnsmasq::sync_dnsmasq_hosts(&pool, &cfg, dnsmasq_status.as_ref(), None).await
+    {
+        tracing::error!(error = ?e, "Initialer dnsmasq Sync fehlgeschlagen");
+        dhcp::dnsmasq::record_sync_error(
+            dnsmasq_status.as_ref(),
+            format!("Initialer dnsmasq Sync fehlgeschlagen: {e:#}"),
+        )
+        .await;
+    }
 
     let templates = Tera::new("templates/**/*").context("failed to load templates")?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let state = web::AppState {
         pool: pool.clone(),
         templates: Arc::new(templates),
         config: cfg.clone(),
+        dnsmasq_status,
+        shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
 
     let session_store = PostgresStore::new(pool.clone());
@@ -51,6 +63,10 @@ async fn main() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.await;
+        tracing::info!("shutdown signal received");
+    })
     .await
     .context("server error")?;
 

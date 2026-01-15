@@ -27,6 +27,7 @@ pub struct Config {
     // PXE/iPXE
     pub pxe_enabled: bool,
     pub pxe_root_dir: String,
+    pub tftp_root_dir: String,
     pub pxe_http_base_url: Url,
     pub pxe_tftp_server: String,
     pub pxe_bios_bootfile: String,
@@ -63,6 +64,7 @@ impl Config {
 
         let pxe_enabled = env_bool("PXE_ENABLED").unwrap_or(false);
         let pxe_root_dir = env_default("PXE_ROOT_DIR", "/var/lib/ipmanager/pxe");
+        let tftp_root_dir = env_default("TFTP_ROOT_DIR", "/var/lib/tftpboot");
         let pxe_http_base_url = Url::parse(&env_default(
             "PXE_HTTP_BASE_URL",
             "http://127.0.0.1:3000/pxe-assets",
@@ -76,7 +78,7 @@ impl Config {
         let dnsmasq_hosts_file =
             env_default("DNSMASQ_HOSTS_FILE", "/etc/dnsmasq.d/01-rust-hosts.conf");
         let dnsmasq_reload_cmd =
-            env_default("DNSMASQ_RELOAD_CMD", "sudo systemctl kill -s SIGHUP dnsmasq");
+            env_default("DNSMASQ_RELOAD_CMD", "sudo systemctl restart dnsmasq");
         let dnsmasq_interface = env_optional("DNSMASQ_INTERFACE");
         let dnsmasq_bind_addr = env_default("DNSMASQ_BIND_ADDR", "127.0.0.1");
         let dnsmasq_port = env_u16("DNSMASQ_PORT").unwrap_or(53);
@@ -99,6 +101,7 @@ impl Config {
 
             pxe_enabled,
             pxe_root_dir,
+            tftp_root_dir,
             pxe_http_base_url,
             pxe_tftp_server,
             pxe_bios_bootfile,

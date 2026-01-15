@@ -12,11 +12,13 @@ use sqlx::PgPool;
 use std::{
     collections::HashSet,
     net::{Ipv4Addr, SocketAddr},
-    path::Path as StdPath,
+    path::{Path as StdPath, PathBuf},
     str::FromStr,
     sync::Arc,
 };
 use tera::{Context, Tera};
+use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tower_sessions::Session;
 use uuid::Uuid;
 
@@ -30,6 +32,8 @@ pub struct AppState {
     pub pool: PgPool,
     pub templates: Arc<Tera>,
     pub config: crate::config::Config,
+    pub dnsmasq_status: Arc<Mutex<dnsmasq::DnsmasqStatus>>,
+    pub shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 /* ----------------------------- API (JSON) ----------------------------- */
@@ -60,6 +64,59 @@ pub struct LanOutletApiItem {
 #[derive(Deserialize)]
 pub struct FindFreeIpQuery {
     pub subnet_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct HostsApiQuery {
+    pub q: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct HostApiItem {
+    pub id: String,
+    pub hostname: String,
+    pub ip: String,
+    pub mac: String,
+    pub pxe_enabled: bool,
+    pub pxe_image_name: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct HostsApiResponse {
+    pub items: Vec<HostApiItem>,
+    pub page: u32,
+    pub per_page: u32,
+    pub total: i64,
+    pub total_pages: u32,
+}
+
+#[derive(Serialize)]
+pub struct DnsmasqSyncStatusResponse {
+    pub last_restart_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_test_ok: Option<bool>,
+    pub last_test_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_test_error: Option<String>,
+    pub tftp_files: Vec<String>,
+    pub orphaned_hosts: Vec<OrphanedHost>,
+    pub warnings: Vec<String>,
+    pub audit_logs: Vec<AuditLogEntry>,
+}
+
+#[derive(Serialize)]
+pub struct OrphanedHost {
+    pub hostname: String,
+    pub mac_address: String,
+    pub pxe_image: String,
+}
+
+#[derive(Serialize)]
+pub struct AuditLogEntry {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub user_id: Option<String>,
+    pub action: String,
+    pub details: serde_json::Value,
 }
 
 /* ----------------------------- SSR (HTML) ----------------------------- */
@@ -281,9 +338,9 @@ pub fn router(state: AppState) -> Router {
         .route("/me", get(me_page))
         .route("/hosts", get(hosts_list).post(hosts_create))
         .route("/hosts/new", get(hosts_new))
-        .route("/hosts/{id}", get(host_show).post(host_update))
-        .route("/hosts/{id}/edit", get(host_edit))
-        .route("/hosts/{id}/delete", post(host_delete))
+        .route("/hosts/:id", get(host_show).post(host_update))
+        .route("/hosts/:id/edit", get(host_edit))
+        .route("/hosts/:id/delete", post(host_delete))
         .route("/locations", get(locations_list).post(locations_create))
         .route("/locations/new", get(locations_new))
         .route(
@@ -294,8 +351,8 @@ pub fn router(state: AppState) -> Router {
         .route("/subnets", get(subnets_list).post(subnets_create))
         .route("/subnets/", get(|| async { Redirect::to("/subnets") }))
         .route("/subnets/new", get(subnets_new))
-        .route("/subnets/{id}/edit", get(subnets_edit))
-        .route("/subnets/{id}", post(subnets_update))
+        .route("/subnets/:id/edit", get(subnets_edit))
+        .route("/subnets/:id", post(subnets_update))
         // dnsmasq DHCP
         .route("/dhcp/dnsmasq", get(dhcp_dnsmasq_page))
         .route("/dhcp/dnsmasq/deploy", post(dhcp_dnsmasq_deploy))
@@ -305,7 +362,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/login", post(api_login))
         .route("/api/me", get(api_me))
         .route("/api/lan-outlets", get(api_lan_outlets_by_location))
-        .route("/api/find-free-ip", get(api_find_free_ip));
+        .route("/api/find-free-ip", get(api_find_free_ip))
+        .route("/api/hosts", get(api_hosts))
+        .route("/api/dnsmasq/status", get(api_dnsmasq_status))
+        .route("/api/admin/shutdown", post(api_admin_shutdown));
 
     if state.config.pxe_enabled {
         let pxe_root =
@@ -318,10 +378,10 @@ pub fn router(state: AppState) -> Router {
                 get(pxe_images_new).post(pxe_images_create),
             )
             .route(
-                "/pxe/images/{id}/edit",
+                "/pxe/images/:id/edit",
                 get(pxe_images_edit).post(pxe_images_update),
             )
-            .route("/pxe/images/{id}/delete", post(pxe_images_delete));
+            .route("/pxe/images/:id/delete", post(pxe_images_delete));
         router = router.nest_service("/pxe-assets", ServeDir::new(&pxe_root));
     }
 
@@ -390,6 +450,117 @@ fn list_pxe_files(root_dir: &StdPath) -> Vec<String> {
 
     files.sort();
     files
+}
+
+async fn list_tftp_files(root_dir: &StdPath) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut stack = vec![PathBuf::from(root_dir)];
+
+    while let Some(dir) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = ?e, path = %dir.display(), "failed to read tftp dir");
+                continue;
+            }
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_type = match entry.file_type().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = ?e, path = %path.display(), "failed to read tftp entry");
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("");
+            if ext != "efi" && ext != "kpxe" {
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(root_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            files.push(relative);
+        }
+    }
+
+    files.sort();
+    files
+}
+
+async fn load_orphaned_hosts(pool: &PgPool, tftp_set: &HashSet<String>) -> Vec<OrphanedHost> {
+    let rows: Vec<(String, String, Option<String>)> = match sqlx::query_as(
+        "select h.hostname,
+                h.mac_address,
+                coalesce(pi.chain_url, pi.kernel_path) as pxe_image
+         from hosts h
+         left join pxe_images pi on pi.id = h.pxe_image_id
+         where h.pxe_image_id is not null",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to load hosts for orphaned PXE validation");
+            return Vec::new();
+        }
+    };
+
+    rows.into_iter()
+        .filter_map(|(hostname, mac_address, pxe_image)| {
+            let image = pxe_image.as_deref().map(str::trim).filter(|v| !v.is_empty())?;
+            if !valid_rel_path(image) {
+                return None;
+            }
+            if tftp_set.contains(image) {
+                return None;
+            }
+            Some(OrphanedHost {
+                hostname,
+                mac_address,
+                pxe_image: image.to_string(),
+            })
+        })
+        .collect()
+}
+
+async fn load_audit_logs(pool: &PgPool) -> Vec<AuditLogEntry> {
+    let rows: Vec<(chrono::DateTime<chrono::Utc>, Option<Uuid>, String, serde_json::Value)> =
+        match sqlx::query_as(
+            "select timestamp, user_id, action, details
+             from audit_logs
+             order by timestamp desc
+             limit 5",
+        )
+        .fetch_all(pool)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to load audit logs");
+            return Vec::new();
+        }
+    };
+
+    rows.into_iter()
+        .map(|(timestamp, user_id, action, details)| AuditLogEntry {
+            timestamp,
+            user_id: user_id.map(|id| id.to_string()),
+            action,
+            details,
+        })
+        .collect()
 }
 
 fn sanitize_label(s: &str) -> String {
@@ -494,7 +665,7 @@ async fn find_free_ip(state: &AppState, subnet_id: Uuid) -> Result<Ipv4Addr, Str
     };
 
     let taken_hosts: HashSet<Ipv4Addr> =
-        sqlx::query_scalar::<_, String>("select host(ip_address) from hosts where subnet_id = $1")
+        sqlx::query_scalar::<_, String>("select ip_address from hosts where subnet_id = $1")
             .bind(subnet_id)
             .fetch_all(&state.pool)
             .await
@@ -546,6 +717,21 @@ async fn require_auth_api(session: &Session) -> Result<(), StatusCode> {
     } else {
         Err(StatusCode::UNAUTHORIZED)
     }
+}
+
+async fn load_user_id_from_session(session: &Session, pool: &PgPool) -> Option<Uuid> {
+    let username: Option<String> = session.get("username").await.ok().flatten();
+    let username = username?.trim().to_string();
+    if username.is_empty() {
+        return None;
+    }
+    let row: Option<(Uuid,)> = sqlx::query_as("select id from users where username = $1")
+        .bind(username)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    row.map(|(id,)| id)
 }
 
 /* ----------------------------- Dropdown loaders ----------------------------- */
@@ -707,7 +893,15 @@ async fn me_page(State(state): State<AppState>, session: Session) -> Response {
 /* ----------------------------- dnsmasq DHCP (SSR) ----------------------------- */
 
 async fn try_sync_dnsmasq(state: &AppState, context: &str) {
-    if let Err(e) = dnsmasq::sync_dnsmasq_hosts(&state.pool, &state.config).await {
+    if let Err(e) =
+        dnsmasq::sync_dnsmasq_hosts(
+            &state.pool,
+            &state.config,
+            state.dnsmasq_status.as_ref(),
+            None,
+        )
+            .await
+    {
         tracing::error!(error = ?e, %context, "dnsmasq sync failed");
     } else {
         tracing::info!(%context, "dnsmasq sync completed");
@@ -835,7 +1029,15 @@ async fn dhcp_dnsmasq_deploy(State(state): State<AppState>, session: Session) ->
         }
     };
 
-    if let Err(e) = dnsmasq::sync_dnsmasq_hosts(&state.pool, &cfg).await {
+    let user_id = load_user_id_from_session(&session, &state.pool).await;
+    if let Err(e) = dnsmasq::sync_dnsmasq_hosts(
+        &state.pool,
+        &cfg,
+        state.dnsmasq_status.as_ref(),
+        user_id,
+    )
+    .await
+    {
         tracing::error!(error = ?e, "dnsmasq deploy failed");
 
         let mut ctx = Context::new();
@@ -906,7 +1108,7 @@ async fn hosts_list(
         match sqlx::query_as(
             "select h.id,
                         h.hostname,
-                        host(h.ip_address),
+                        h.ip_address,
                         h.mac_address,
                         l.name as location_name,
                         o.label as lan_outlet_label,
@@ -1207,10 +1409,10 @@ async fn hosts_create(
     // Vor dem Insert prüfen, ob Hostname/IP/MAC schon existieren
     if let Ok(Some((conflict_host, conflict_ip, conflict_mac))) =
         sqlx::query_as::<_, (String, String, String)>(
-            "select hostname, host(ip_address), mac_address
+            "select hostname, ip_address, mac_address
          from hosts
          where hostname = $1
-            or ip_address = $2::inet
+            or ip_address = $2
             or mac_address = $3
          limit 1",
         )
@@ -1313,7 +1515,7 @@ async fn hosts_create(
 
     let res = sqlx::query(
         "insert into hosts (hostname, ip_address, mac_address, location_id, lan_outlet_id, subnet_id, pxe_enabled, pxe_image_id)
-         values ($1, $2::inet, $3, $4, $5, $6, $7, $8)",
+         values ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(&hostname)
     .bind(ip.to_string())
@@ -1332,7 +1534,14 @@ async fn hosts_create(
                 rows_affected = r.rows_affected(),
                 "Inserted host into database"
             );
-            let warning = match dnsmasq::sync_dnsmasq_hosts(&state.pool, &state.config).await {
+            let warning = match dnsmasq::sync_dnsmasq_hosts(
+                &state.pool,
+                &state.config,
+                state.dnsmasq_status.as_ref(),
+                None,
+            )
+            .await
+            {
                 Ok(_) => None,
                 Err(e) => {
                     tracing::error!(error = ?e, "dnsmasq sync failed after host create");
@@ -1413,10 +1622,10 @@ async fn host_show(
         return resp;
     }
 
-    let row: Option<HostShowRowDb> = match sqlx::query_as(
+    let row: HostShowRowDb = match sqlx::query_as(
         "select h.id,
                 h.hostname,
-                host(h.ip_address),
+                h.ip_address,
                 h.mac_address,
                 h.location_id,
                 h.lan_outlet_id,
@@ -1436,14 +1645,21 @@ async fn host_show(
          limit 1",
     )
     .bind(id)
-    .fetch_optional(&state.pool)
+    .fetch_one(&state.pool)
     .await
     {
         Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(sqlx::Error::RowNotFound) => {
+            tracing::error!(host_id = %id, "host_show not found");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, host_id = %id, "DB error in host_show");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
-    let Some((
+    let (
         hid,
         hostname,
         ip,
@@ -1457,10 +1673,7 @@ async fn host_show(
         pxe_enabled,
         pxe_image_id,
         pxe_image_name,
-    )) = row
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    ) = row;
 
     let host = HostShow {
         id: hid.to_string(),
@@ -1625,10 +1838,10 @@ async fn host_update(
     // Vor dem Update prüfen, ob Hostname/IP/MAC schon existieren (anderer Datensatz)
     if let Ok(Some((conflict_host, conflict_ip, conflict_mac))) =
         sqlx::query_as::<_, (String, String, String)>(
-            "select hostname, host(ip_address), mac_address
+            "select hostname, ip_address, mac_address
              from hosts
              where id <> $1
-               and (hostname = $2 or ip_address = $3::inet or mac_address = $4)
+               and (hostname = $2 or ip_address = $3 or mac_address = $4)
              limit 1",
         )
         .bind(id)
@@ -1710,7 +1923,7 @@ async fn host_update(
     let res = sqlx::query(
         "update hosts
          set hostname = $1,
-             ip_address = $2::inet,
+             ip_address = $2,
              mac_address = $3,
              location_id = $4,
              lan_outlet_id = $5,
@@ -1808,7 +2021,7 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
     let row: Option<HostEditRowDb> = sqlx::query_as(
         "select h.id,
                 h.hostname,
-                host(h.ip_address),
+                h.ip_address,
                 h.mac_address,
                 h.location_id,
                 h.lan_outlet_id,
@@ -2584,6 +2797,178 @@ async fn api_find_free_ip(
     }
 }
 
+async fn api_hosts(
+    State(state): State<AppState>,
+    session: Session,
+    Query(q): Query<HostsApiQuery>,
+) -> Result<Json<HostsApiResponse>, StatusCode> {
+    require_auth_api(&session).await?;
+
+    let search = q.q.unwrap_or_default();
+    let search = search.trim().to_string();
+    let page = q.page.unwrap_or(1).max(1);
+    let per_page = q.per_page.unwrap_or(50).clamp(1, 200);
+    let offset = (page - 1) as i64 * per_page as i64;
+
+    let (total, rows): (i64, Vec<HostsListRowDb>) = if search.is_empty() {
+        let total: i64 = sqlx::query_scalar("select count(*) from hosts")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = ?e, "DB error in api_hosts count");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let rows: Vec<HostsListRowDb> = sqlx::query_as(
+            "select h.id,
+                    h.hostname,
+                    h.ip_address,
+                    h.mac_address,
+                    l.name as location_name,
+                    o.label as lan_outlet_label,
+                    h.pxe_enabled,
+                    pi.name as pxe_image_name
+             from hosts h
+             left join locations l on l.id = h.location_id
+             left join lan_outlets o on o.id = h.lan_outlet_id
+             left join pxe_images pi on pi.id = h.pxe_image_id
+             order by h.hostname asc
+             limit $1 offset $2",
+        )
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, "DB error in api_hosts list");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        (total, rows)
+    } else {
+        let like = format!("%{}%", search);
+        let total: i64 = sqlx::query_scalar(
+            "select count(*)
+             from hosts h
+             where h.hostname ilike $1
+                or h.ip_address ilike $1
+                or h.mac_address ilike $1",
+        )
+        .bind(&like)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, "DB error in api_hosts count search");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let rows: Vec<HostsListRowDb> = sqlx::query_as(
+            "select h.id,
+                    h.hostname,
+                    h.ip_address,
+                    h.mac_address,
+                    l.name as location_name,
+                    o.label as lan_outlet_label,
+                    h.pxe_enabled,
+                    pi.name as pxe_image_name
+             from hosts h
+             left join locations l on l.id = h.location_id
+             left join lan_outlets o on o.id = h.lan_outlet_id
+             left join pxe_images pi on pi.id = h.pxe_image_id
+             where h.hostname ilike $1
+                or h.ip_address ilike $1
+                or h.mac_address ilike $1
+             order by h.hostname asc
+             limit $2 offset $3",
+        )
+        .bind(&like)
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, "DB error in api_hosts search");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        (total, rows)
+    };
+
+    let items = rows
+        .into_iter()
+        .map(
+            |(id, hostname, ip, mac, _location_name, _lan_outlet_label, pxe_enabled, pxe_image_name)| {
+                HostApiItem {
+                    id: id.to_string(),
+                    hostname,
+                    ip,
+                    mac,
+                    pxe_enabled,
+                    pxe_image_name,
+                }
+            },
+        )
+        .collect();
+
+    let total_pages = if total == 0 {
+        1
+    } else {
+        ((total as f64) / (per_page as f64)).ceil() as u32
+    };
+
+    Ok(Json(HostsApiResponse {
+        items,
+        page,
+        per_page,
+        total,
+        total_pages,
+    }))
+}
+
+async fn api_dnsmasq_status(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Json<DnsmasqSyncStatusResponse>, StatusCode> {
+    require_auth_api(&session).await?;
+
+    let status = state.dnsmasq_status.lock().await.clone();
+    let (last_test_ok, last_test_at, last_test_error) = match status.last_test {
+        Some(test) => (Some(test.ok), Some(test.at), test.stderr),
+        None => (None, None, None),
+    };
+
+    let tftp_files = list_tftp_files(StdPath::new(&state.config.tftp_root_dir)).await;
+    let tftp_set: HashSet<String> = tftp_files.iter().cloned().collect();
+    let orphaned_hosts = load_orphaned_hosts(&state.pool, &tftp_set).await;
+    let audit_logs = load_audit_logs(&state.pool).await;
+
+    Ok(Json(DnsmasqSyncStatusResponse {
+        last_restart_at: status.last_restart_at,
+        last_test_ok,
+        last_test_at,
+        last_test_error,
+        tftp_files,
+        orphaned_hosts,
+        warnings: status.warnings,
+        audit_logs,
+    }))
+}
+
+async fn api_admin_shutdown(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<StatusCode, StatusCode> {
+    require_auth_api(&session).await?;
+
+    let mut guard = state.shutdown_tx.lock().await;
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(());
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Ok(StatusCode::GONE)
+    }
+}
+
 /* ----------------------------- PXE / iPXE ----------------------------- */
 
 fn validate_pxe_form(
@@ -2931,7 +3316,7 @@ async fn boot_ipxe(
     }
 
     let should_boot = match sqlx::query_scalar::<_, bool>(
-        "select pxe_enabled from hosts where ip_address = $1::inet limit 1",
+        "select pxe_enabled from hosts where ip_address = $1 limit 1",
     )
     .bind(client_ip.to_string())
     .fetch_optional(&state.pool)
@@ -3428,6 +3813,7 @@ mod tests {
             session_ttl: Duration::from_secs(3600),
             pxe_enabled: true,
             pxe_root_dir: "/var/lib/ipmanager/pxe".to_string(),
+            tftp_root_dir: "/var/lib/tftpboot".to_string(),
             pxe_http_base_url: Url::parse("http://localhost:3000/pxe-assets").unwrap(),
             pxe_tftp_server: "192.0.2.1".to_string(),
             pxe_bios_bootfile: "undionly.kpxe".to_string(),

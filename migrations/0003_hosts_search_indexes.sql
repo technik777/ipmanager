@@ -7,5 +7,5 @@ on hosts using gin (location gin_trgm_ops);
 create index if not exists hosts_lan_dose_trgm_idx
 on hosts using gin (lan_dose gin_trgm_ops);
 
-create index if not exists hosts_mac_trgm_idx
-on hosts using gin (mac gin_trgm_ops);
+create index if not exists hosts_mac_address_trgm_idx
+on hosts using gin (mac_address gin_trgm_ops);

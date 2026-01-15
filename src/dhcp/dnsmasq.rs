@@ -1,15 +1,47 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use serde_json::Value as JsonValue;
 use sqlx::{FromRow, PgPool};
 use tokio::process::Command;
+use std::collections::HashSet;
+use std::net::Ipv4Addr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::str::FromStr;
+use uuid::Uuid;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::Mutex;
 
 use crate::domain::mac::MacAddr;
 const DNSMASQ_GLOBAL_CONFIG_PATH: &str = "/etc/dnsmasq.d/00-global.conf";
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsmasqTestResult {
+    pub ok: bool,
+    pub stderr: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct DnsmasqStatus {
+    pub last_test: Option<DnsmasqTestResult>,
+    pub last_restart_at: Option<DateTime<Utc>>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct HostRow {
+    id: Uuid,
     mac_address: String,
     ip_address: String,
+    #[allow(dead_code)]
     hostname: Option<String>,
+    subnet_id: Uuid,
+    subnet_cidr: String,
+    gateway: Option<String>,
+    dns_primary: Option<String>,
+    pxe_image: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -90,11 +122,35 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
     Ok(())
 }
 
-pub async fn sync_dnsmasq_hosts(pool: &PgPool, config: &crate::config::Config) -> Result<()> {
+pub async fn sync_dnsmasq_hosts(
+    pool: &PgPool,
+    config: &crate::config::Config,
+    status: &Mutex<DnsmasqStatus>,
+    user_id: Option<Uuid>,
+) -> Result<()> {
     generate_global_config(pool, config).await?;
+    check_infrastructure(Path::new(&config.tftp_root_dir)).await?;
+
+    let tftp_files = list_tftp_files(Path::new(&config.tftp_root_dir)).await;
+    let tftp_set: HashSet<String> = tftp_files.into_iter().collect();
+    let mut warnings = Vec::new();
 
     let hosts: Vec<HostRow> = match sqlx::query_as(
-        "select mac_address::text as mac_address, host(ip_address) as ip_address, hostname from hosts",
+        "select h.id,
+                h.mac_address::text as mac_address,
+                h.ip_address,
+                h.hostname,
+                h.subnet_id,
+                s.cidr::text as subnet_cidr,
+                s.gateway::text as gateway,
+                s.dns_primary::text as dns_primary
+                ,
+                coalesce(pi.chain_url, pi.kernel_path) as pxe_image
+         from hosts h
+         join subnets s on s.id = h.subnet_id
+         left join pxe_images pi on pi.id = h.pxe_image_id
+         where s.dhcp_enabled = true
+         order by s.name, h.hostname",
     )
     .fetch_all(pool)
     .await
@@ -106,50 +162,125 @@ pub async fn sync_dnsmasq_hosts(pool: &PgPool, config: &crate::config::Config) -
         }
     };
 
-    let mut output = String::new();
-    output.push_str("dhcp-ignore=tag:!known_host\n");
-    if config.pxe_enabled {
-        let boot_url = format!(
-            "{}/boot.ipxe",
-            config.base_url.as_str().trim_end_matches('/')
-        );
-        output.push_str("# iPXE Filter & Boot-Steuerung\n");
-        output.push_str("dhcp-userclass=set:ipxe,iPXE\n");
-        output.push_str("dhcp-boot=tag:!ipxe,ipxe.efi\n");
-        output.push_str(&format!("dhcp-boot=tag:ipxe,{}\n", boot_url));
-        output.push_str("enable-tftp\n");
-        output.push_str(&format!("tftp-root={}\n\n", config.pxe_root_dir));
-    }
-    for host in hosts {
+    let file = tokio::fs::File::create(&config.dnsmasq_hosts_file).await.with_context(|| {
+        format!(
+            "failed to open dnsmasq hosts file {}",
+            config.dnsmasq_hosts_file
+        )
+    })?;
+    let mut writer = BufWriter::new(file);
+
+    for host in &hosts {
         let mac = MacAddr::from_str(host.mac_address.trim()).with_context(|| {
             format!("invalid mac_address in hosts table: {}", host.mac_address)
         })?;
-        output.push_str(&format!(
-            "dhcp-host={},{},set:known_host\n",
-            mac, host.ip_address
-        ));
-    }
-
-    if let Err(e) = tokio::fs::write(&config.dnsmasq_hosts_file, output).await {
-        tracing::error!(
-            error = ?e,
-            path = %config.dnsmasq_hosts_file,
-            "failed to write dnsmasq hosts file"
+        let client_tag = client_tag(host.id);
+        let mut host_line = format!(
+            "dhcp-host={},set:known_host,set:{},{},",
+            mac, client_tag, host.ip_address
         );
-        return Err(e).with_context(|| {
-            format!(
-                "failed to write dnsmasq hosts file to {}",
-                config.dnsmasq_hosts_file
+        if let Some(name) = host.hostname.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            host_line.push_str(name);
+        } else if host_line.ends_with(',') {
+            host_line.pop();
+        }
+        host_line.push('\n');
+        writer.write_all(host_line.as_bytes()).await?;
+        if let Some(name) = host.hostname.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            if name.chars().any(|c| c.is_whitespace()) {
+                tracing::warn!(
+                    host_id = %host.id,
+                    hostname = %name,
+                    "hostname contains whitespace; skipping address record"
+                );
+            } else {
+                writer
+                    .write_all(format!("address=/{}/{}\n", name, host.ip_address).as_bytes())
+                    .await?;
+            }
+        }
+
+        let tag = subnet_tag(&host.subnet_cidr, host.gateway.as_deref(), host.subnet_id);
+        if let Some(gateway) = host.gateway.as_deref() {
+            writer
+                .write_all(
+                    format!("dhcp-option=tag:{},option:router,{}\n", tag, gateway).as_bytes(),
+                )
+                .await?;
+        } else {
+            tracing::warn!(
+                subnet_id = %host.subnet_id,
+                subnet_cidr = %host.subnet_cidr,
+                "missing gateway for subnet; skipping dhcp-option router"
+            );
+        }
+        if let Some(dns_primary) = host.dns_primary.as_deref() {
+            writer
+                .write_all(
+                    format!(
+                        "dhcp-option=tag:{},option:dns-server,{}\n",
+                        client_tag, dns_primary
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+        } else if let Some(gateway) = host.gateway.as_deref() {
+            writer
+                .write_all(
+                    format!(
+                        "dhcp-option=tag:{},option:dns-server,{}\n",
+                        client_tag, gateway
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+        } else {
+            tracing::warn!(
+                subnet_id = %host.subnet_id,
+                subnet_cidr = %host.subnet_cidr,
+                "missing dns_primary and gateway for DNS option"
+            );
+        }
+        let pxe_image_raw = host
+            .pxe_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let mut pxe_image = pxe_image_raw.unwrap_or("undionly.kpxe");
+
+        if let Some(candidate) = pxe_image_raw {
+            if valid_rel_path(candidate) && !tftp_set.contains(candidate) {
+                let warning = format!(
+                    "PXE-Image fehlt auf Platte: host_id={}, mac={}, image={}",
+                    host.id, host.mac_address, candidate
+                );
+                warnings.push(warning.clone());
+                tracing::warn!("{}", warning);
+                pxe_image = "undionly.kpxe";
+            }
+        }
+        writer
+            .write_all(
+                format!("dhcp-boot=tag:{},{}\n", client_tag, pxe_image).as_bytes(),
             )
-        });
+            .await?;
     }
+    writer.flush().await?;
+
+    let warnings_count = warnings.len();
+    update_warnings(status, warnings).await;
 
     tracing::info!(
         path = %config.dnsmasq_hosts_file,
         "dnsmasq hosts file written"
     );
 
-    match Command::new("dnsmasq").arg("--test").output().await {
+    match Command::new("dnsmasq")
+        .arg("--test")
+        .arg("--conf-file=/etc/dnsmasq.conf")
+        .output()
+        .await
+    {
         Ok(output) => {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -158,19 +289,24 @@ pub async fn sync_dnsmasq_hosts(pool: &PgPool, config: &crate::config::Config) -
                     stderr = %stderr,
                     "dnsmasq --test failed"
                 );
+                update_last_test(status, false, Some(stderr.to_string())).await;
                 return Err(anyhow::anyhow!("dnsmasq --test failed: {}", stderr));
             }
+            update_last_test(status, true, None).await;
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!("dnsmasq binary not found; skipping dnsmasq --test");
+            tracing::error!("dnsmasq binary not found; cannot run dnsmasq --test");
+            update_last_test(status, false, Some("dnsmasq binary not found".to_string())).await;
+            return Err(e).context("dnsmasq binary not found");
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to execute dnsmasq --test");
+            update_last_test(status, false, Some(format!("{:?}", e))).await;
             return Err(e).context("failed to execute dnsmasq --test");
         }
     }
 
-    let status = match Command::new("sh")
+    let reload_status = match Command::new("sh")
         .arg("-c")
         .arg(&config.dnsmasq_reload_cmd)
         .status()
@@ -187,15 +323,37 @@ pub async fn sync_dnsmasq_hosts(pool: &PgPool, config: &crate::config::Config) -
         }
     };
 
-    if !status.success() {
+    if !reload_status.success() {
         tracing::error!(
-            status = %status,
+            status = %reload_status,
             command = %config.dnsmasq_reload_cmd,
             "dnsmasq reload command failed"
         );
         return Err(anyhow::anyhow!(
-            "dnsmasq reload command failed with status: {status}"
+            "dnsmasq reload command failed with status: {reload_status}"
         ));
+    }
+
+    {
+        let mut guard = status.lock().await;
+        guard.last_restart_at = Some(Utc::now());
+    }
+
+    let details: JsonValue = serde_json::json!({
+        "hosts_updated": hosts.len(),
+        "warnings_count": warnings_count,
+        "has_orphans": warnings_count > 0,
+    });
+    if let Err(e) = sqlx::query(
+        "insert into audit_logs (user_id, action, details) values ($1, $2, $3)",
+    )
+    .bind(user_id)
+    .bind("dnsmasq_sync")
+    .bind(details)
+    .execute(pool)
+    .await
+    {
+        tracing::error!(error = ?e, "failed to write audit log for dnsmasq sync");
     }
 
     tracing::info!(
@@ -204,4 +362,140 @@ pub async fn sync_dnsmasq_hosts(pool: &PgPool, config: &crate::config::Config) -
     );
 
     Ok(())
+}
+
+fn subnet_tag(cidr: &str, gateway: Option<&str>, subnet_id: Uuid) -> String {
+    if let Some(tag) = gateway.and_then(ipv4_tag) {
+        return tag;
+    }
+
+    let cidr_ip = cidr.split('/').next().unwrap_or(cidr).trim();
+    if let Some(tag) = ipv4_tag(cidr_ip) {
+        return tag;
+    }
+
+    let fallback = subnet_id.to_string().replace('-', "_");
+    format!("net_{}", fallback)
+}
+
+fn ipv4_tag(value: &str) -> Option<String> {
+    let ip: Ipv4Addr = value.parse().ok()?;
+    let mut parts: Vec<String> = ip.octets().iter().map(|octet| octet.to_string()).collect();
+    while parts.len() > 1 && parts.last().map(String::as_str) == Some("0") {
+        parts.pop();
+    }
+    Some(format!("net_{}", parts.join("_")))
+}
+
+fn client_tag(id: Uuid) -> String {
+    format!("client_{}", id.to_string().replace('-', "_"))
+}
+
+async fn check_infrastructure(tftp_root: &Path) -> Result<()> {
+    if let Err(e) = tokio::fs::create_dir_all(tftp_root).await {
+        tracing::error!(error = ?e, path = %tftp_root.display(), "failed to create tftp root");
+        return Err(e).context("failed to create tftp root");
+    }
+
+    let permissions = std::fs::Permissions::from_mode(0o755);
+    if let Err(e) = tokio::fs::set_permissions(tftp_root, permissions).await {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            tracing::warn!(
+                error = ?e,
+                path = %tftp_root.display(),
+                "permission denied while setting tftp root permissions"
+            );
+            if tokio::fs::read_dir(tftp_root).await.is_err() {
+                return Err(e).context("tftp root is not readable");
+            }
+        } else {
+            tracing::error!(
+                error = ?e,
+                path = %tftp_root.display(),
+                "failed to set tftp root permissions"
+            );
+            return Err(e).context("failed to set tftp root permissions");
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn record_sync_error(status: &Mutex<DnsmasqStatus>, message: String) {
+    let mut guard = status.lock().await;
+    guard.warnings = vec![message];
+}
+
+async fn update_last_test(
+    status: &Mutex<DnsmasqStatus>,
+    ok: bool,
+    stderr: Option<String>,
+) {
+    let mut guard = status.lock().await;
+    guard.last_test = Some(DnsmasqTestResult {
+        ok,
+        stderr,
+        at: Utc::now(),
+    });
+}
+
+async fn update_warnings(status: &Mutex<DnsmasqStatus>, warnings: Vec<String>) {
+    let mut guard = status.lock().await;
+    guard.warnings = warnings;
+}
+
+async fn list_tftp_files(root_dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut stack = vec![root_dir.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = ?e, path = %dir.display(), "failed to read tftp dir");
+                continue;
+            }
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_type = match entry.file_type().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = ?e, path = %path.display(), "failed to read tftp entry");
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("");
+            if ext != "efi" && ext != "kpxe" {
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(root_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            files.push(relative);
+        }
+    }
+
+    files.sort();
+    files
+}
+
+fn valid_rel_path(p: &str) -> bool {
+    let path = Path::new(p);
+    !p.is_empty()
+        && !path.is_absolute()
+        && !p.starts_with('/')
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
 }

@@ -21,7 +21,7 @@ create table if not exists users (
 create table if not exists hosts (
   id uuid primary key default gen_random_uuid(),
   hostname text not null unique,
-  ip_address inet not null unique,
+  ip_address text not null unique,
   mac_address text not null unique,
   subnet_id uuid not null references subnets(id) on delete restrict,
   sync_status text not null default 'pending',

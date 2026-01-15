@@ -54,8 +54,8 @@ for each row execute function set_updated_at();
 create table hosts (
   id uuid primary key default gen_random_uuid(),
   hostname text not null unique,
-  ip inet not null unique,
-  mac text not null unique,
+  ip_address text not null unique,
+  mac_address text not null unique,
   subnet_id uuid not null references subnets(id) on delete restrict,
   pxe_enabled boolean not null default false,
   description text null,
@@ -64,8 +64,8 @@ create table hosts (
   updated_at timestamptz not null default now()
 );
 create index hosts_subnet_id_idx on hosts (subnet_id);
-create index hosts_ip_idx on hosts (ip);
-create index hosts_mac_idx on hosts (mac);
+create index hosts_ip_address_idx on hosts (ip_address);
+create index hosts_mac_address_idx on hosts (mac_address);
 create index hosts_hostname_trgm_idx on hosts using gin (hostname gin_trgm_ops);
 create trigger hosts_set_updated_at
 before update on hosts
