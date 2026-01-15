@@ -303,15 +303,19 @@ pub async fn sync_dnsmasq_hosts(
                     "dnsmasq --test failed"
                 );
                 update_last_test(status, false, Some(stderr.to_string())).await;
-                if let Err(e) = email::send_admin_alert(
-                    config,
-                    "ipmanager: dnsmasq --test fehlgeschlagen",
-                    &format!("dnsmasq --test ist fehlgeschlagen:\n{stderr}"),
-                )
-                .await
-                {
-                    tracing::error!(error = ?e, "failed to send dnsmasq test email alert");
-                }
+                let cfg = config.clone();
+                let body = format!("dnsmasq --test ist fehlgeschlagen:\n{stderr}");
+                tokio::spawn(async move {
+                    if let Err(e) = email::send_admin_alert(
+                        &cfg,
+                        "ipmanager: dnsmasq --test fehlgeschlagen",
+                        &body,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = ?e, "failed to send dnsmasq test email alert");
+                    }
+                });
                 return Err(anyhow::anyhow!("dnsmasq --test failed: {}", stderr));
             }
             update_last_test(status, true, None).await;
@@ -351,6 +355,22 @@ pub async fn sync_dnsmasq_hosts(
             command = %config.dnsmasq_reload_cmd,
             "dnsmasq reload command failed"
         );
+        let cfg = config.clone();
+        let body = format!(
+            "dnsmasq reload command failed: {}\ncommand: {}",
+            reload_status, cfg.dnsmasq_reload_cmd
+        );
+        tokio::spawn(async move {
+            if let Err(e) = email::send_admin_alert(
+                &cfg,
+                "ipmanager: dnsmasq restart fehlgeschlagen",
+                &body,
+            )
+            .await
+            {
+                tracing::error!(error = ?e, "failed to send dnsmasq restart email alert");
+            }
+        });
         return Err(anyhow::anyhow!(
             "dnsmasq reload command failed with status: {reload_status}"
         ));
@@ -385,9 +405,12 @@ pub async fn sync_dnsmasq_hosts(
 Bitte pruefe die PXE-Images im TFTP-Root ({}).",
             config.tftp_root_dir
         );
-        if let Err(e) = email::send_admin_alert(config, subject, &body).await {
-            tracing::error!(error = ?e, "failed to send orphaned PXE email alert");
-        }
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = email::send_admin_alert(&cfg, subject, &body).await {
+                tracing::error!(error = ?e, "failed to send orphaned PXE email alert");
+            }
+        });
     }
 
     if let Err(e) = macmon::sync_new_hosts(pool, config).await {

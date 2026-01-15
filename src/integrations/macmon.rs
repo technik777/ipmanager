@@ -5,6 +5,7 @@ use sqlx::PgPool;
 
 use crate::config::Config;
 use crate::domain::mac::MacAddr;
+use crate::notifications::email;
 
 #[derive(Serialize)]
 struct MacmonEndpointRequest<'a> {
@@ -75,8 +76,8 @@ pub async fn sync_new_hosts(pool: &PgPool, cfg: &Config) -> Result<usize> {
                 sent += 1;
             }
             Ok(r) if r.status() == StatusCode::CONFLICT => {
-                tracing::info!(url = %endpoint_url, status = %r.status(), "macmon request conflict");
-                tracing::info!(mac = %mac_raw, "macmon endpoint already exists; marking exported");
+                tracing::debug!(url = %endpoint_url, status = %r.status(), "macmon request conflict");
+                tracing::debug!(mac = %mac_raw, "macmon endpoint already exists; marking exported");
                 if let Err(e) = mark_exported(pool, &mac_raw).await {
                     tracing::error!(error = ?e, mac = %mac_raw, "failed to mark macmon export");
                 }
@@ -84,13 +85,34 @@ pub async fn sync_new_hosts(pool: &PgPool, cfg: &Config) -> Result<usize> {
             Ok(r) => {
                 let status = r.status();
                 let body = r.text().await.unwrap_or_default();
-                tracing::error!(
+                tracing::debug!(
                     mac = %mac_raw,
                     url = %endpoint_url,
                     status = %status,
                     body = %body,
                     "macmon create endpoint failed"
                 );
+                if status.is_client_error() || status.is_server_error() {
+                    let cfg = cfg.clone();
+                    let message = format!(
+                        "macmon API returned {status} for {mac}.\nURL: {url}\nBody: {body}",
+                        status = status,
+                        mac = mac_raw,
+                        url = endpoint_url,
+                        body = body
+                    );
+                    tokio::spawn(async move {
+                        if let Err(e) = email::send_admin_alert(
+                            &cfg,
+                            "ipmanager: macmon API Fehler",
+                            &message,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = ?e, "failed to send macmon email alert");
+                        }
+                    });
+                }
             }
             Err(e) => {
                 tracing::error!(error = ?e, mac = %mac_raw, "macmon request failed");

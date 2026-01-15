@@ -563,10 +563,6 @@ async fn load_audit_logs(pool: &PgPool) -> Vec<AuditLogEntry> {
         .collect()
 }
 
-fn sanitize_label(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
-}
-
 fn sanitize_cmdline(s: &str) -> String {
     s.lines()
         .map(str::trim)
@@ -3231,77 +3227,6 @@ async fn delete_pxe_image(pool: &PgPool, id: i64) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
-fn build_ipxe_script(cfg: &Config, images: &[PxeImage]) -> String {
-    let mut out = String::new();
-    let base_assets = cfg.pxe_http_base_url.as_str().trim_end_matches('/');
-    let boot_url = cfg
-        .base_url
-        .join("boot.ipxe")
-        .map(|u| u.to_string())
-        .unwrap_or_else(|_| format!("{}/boot.ipxe", cfg.base_url));
-
-    out.push_str("#!ipxe\n");
-    out.push_str("set menu-timeout 5000\n");
-    out.push_str(&format!("set base {}\n\n", base_assets));
-    out.push_str(&format!("# tftp-server: {}\n", cfg.pxe_tftp_server));
-    out.push_str(&format!("# bios-bootfile: {}\n", cfg.pxe_bios_bootfile));
-    out.push_str(&format!("# uefi-bootfile: {}\n\n", cfg.pxe_uefi_bootfile));
-    out.push_str(":start\n");
-    out.push_str("menu IPManager PXE Boot Menu\n");
-    out.push_str("item --gap -- ----------------------------\n");
-    out.push_str("item local Local disk\n");
-    out.push_str("item shell iPXE shell\n");
-
-    for img in images {
-        if !img.enabled {
-            continue;
-        }
-        let name = sanitize_label(&img.name);
-        out.push_str(&format!("item img{} {} [{}]\n", img.id, name, img.arch));
-    }
-
-    out.push_str("choose --timeout ${menu-timeout} --default local selected || goto start\n");
-    out.push_str("goto ${selected}\n\n");
-
-    out.push_str(":local\nexit\n\n");
-    out.push_str(":shell\nshell\ngoto start\n\n");
-
-    for img in images {
-        if !img.enabled {
-            continue;
-        }
-        let label = format!("img{}", img.id);
-        out.push_str(&format!(":{}\n", label));
-        match img.kind.as_str() {
-            "linux" => {
-                if let Some(kernel) = &img.kernel_path {
-                    let cmd = sanitize_cmdline(img.cmdline.as_deref().unwrap_or(""));
-                    out.push_str(&format!("kernel ${{base}}/{kernel} {cmd}\n"));
-                    if let Some(initrd) = &img.initrd_path {
-                        out.push_str(&format!("initrd ${{base}}/{initrd}\n"));
-                    }
-                    out.push_str("boot || goto start\n\n");
-                }
-            }
-            "chain" => {
-                if let Some(url) = &img.chain_url {
-                    out.push_str(&format!("chain {url} || goto start\n\n"));
-                }
-            }
-            _ => {
-                out.push_str("goto start\n\n");
-            }
-        }
-    }
-
-    if cfg.pxe_enabled {
-        // Hint for iPXE direct chain if desired
-        out.push_str(&format!("# ipxe boot script served by {}\n", boot_url));
-    }
-
-    out
-}
-
 async fn boot_ipxe(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -3768,10 +3693,7 @@ async fn render_pxe_edit_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_ipxe_script, ensure_path_allowed, validate_ipv4, validate_mac, validate_pxe_form,
-        PxeImage, PxeImageForm,
-    };
+    use super::{ensure_path_allowed, validate_ipv4, validate_mac, validate_pxe_form, PxeImageForm};
     use crate::config::Config;
     use std::fs;
     use std::net::Ipv4Addr;
@@ -3825,6 +3747,7 @@ mod tests {
             smtp_from: None,
             smtp_to: Vec::new(),
             smtp_use_starttls: true,
+            admin_email: None,
             macmon_base_url: None,
             macmon_username: None,
             macmon_password: None,
@@ -3834,43 +3757,6 @@ mod tests {
             dnsmasq_bind_addr: "127.0.0.1".to_string(),
             dnsmasq_port: 53,
         }
-    }
-
-    #[test]
-    fn build_ipxe_includes_items_and_kernel() {
-        let cfg = dummy_config();
-        let images = vec![
-            PxeImage {
-                id: 1,
-                name: "Linux".to_string(),
-                kind: "linux".to_string(),
-                arch: "any".to_string(),
-                kernel_path: Some("vmlinuz".to_string()),
-                initrd_path: Some("initrd.img".to_string()),
-                chain_url: None,
-                cmdline: Some("console=ttyS0".to_string()),
-                enabled: true,
-            },
-            PxeImage {
-                id: 2,
-                name: "Chain".to_string(),
-                kind: "chain".to_string(),
-                arch: "any".to_string(),
-                kernel_path: None,
-                initrd_path: None,
-                chain_url: Some("http://example.com/ipxe".to_string()),
-                cmdline: None,
-                enabled: true,
-            },
-        ];
-
-        let script = build_ipxe_script(&cfg, &images);
-        assert!(script.contains("#!ipxe"));
-        assert!(script.contains("item img1 Linux"));
-        assert!(script.contains("kernel ${base}/vmlinuz console=ttyS0"));
-        assert!(script.contains("initrd ${base}/initrd.img"));
-        assert!(script.contains("item img2 Chain"));
-        assert!(script.contains("chain http://example.com/ipxe"));
     }
 
     #[test]

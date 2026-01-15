@@ -11,11 +11,6 @@ pub async fn send_admin_alert(cfg: &Config, subject: &str, body: &str) -> Result
         return Ok(());
     };
 
-    if cfg.smtp_to.is_empty() {
-        tracing::info!("SMTP_TO not set; skipping email alert");
-        return Ok(());
-    }
-
     let from_addr = cfg
         .smtp_from
         .as_deref()
@@ -23,8 +18,19 @@ pub async fn send_admin_alert(cfg: &Config, subject: &str, body: &str) -> Result
         .parse::<Mailbox>()
         .context("SMTP_FROM is invalid")?;
 
+    let recipients: Vec<String> = if let Some(admin) = cfg.admin_email.as_deref() {
+        vec![admin.to_string()]
+    } else {
+        cfg.smtp_to.clone()
+    };
+
+    if recipients.is_empty() {
+        tracing::info!("ADMIN_EMAIL/SMTP_TO not set; skipping email alert");
+        return Ok(());
+    }
+
     let mut builder = Message::builder().from(from_addr).subject(subject);
-    for to in &cfg.smtp_to {
+    for to in &recipients {
         let mailbox = to.parse::<Mailbox>().context("SMTP_TO is invalid")?;
         builder = builder.to(mailbox);
     }
