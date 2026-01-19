@@ -81,6 +81,7 @@ pub struct HostApiItem {
     pub mac: String,
     pub pxe_enabled: bool,
     pub pxe_image_name: Option<String>,
+    pub os_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -137,6 +138,7 @@ pub struct HostCreateForm {
     pub subnet_id: String,
     pub pxe_enabled: Option<String>,
     pub pxe_image_id: Option<String>,
+    pub os_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +151,7 @@ pub struct HostUpdateForm {
     pub subnet_id: String,
     pub pxe_enabled: Option<String>,
     pub pxe_image_id: Option<String>,
+    pub os_type: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -216,6 +219,7 @@ struct HostRow {
     lan_outlet_label: Option<String>,
     pxe_enabled: bool,
     pxe_image_name: Option<String>,
+    os_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -233,6 +237,7 @@ struct HostShow {
     pxe_enabled: bool,
     pxe_image_id: Option<String>,
     pxe_image_name: Option<String>,
+    os_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -942,18 +947,24 @@ fn map_dnsmasq_sync_error(error: &anyhow::Error) -> DnsmasqWarning {
             message: "DNSMASQ Sync scheiterte beim Laden der Hosts aus der DB.".to_string(),
         };
     }
-    if message.contains("failed to write dnsmasq hosts file") {
+    if message.contains("failed to write dnsmasq host file") {
         return DnsmasqWarning {
             code: "write_failed".to_string(),
             message: "DNSMASQ Hosts-Datei konnte nicht geschrieben werden.".to_string(),
         };
     }
     if message.contains("dnsmasq reload command failed")
-        || message.contains("failed to execute dnsmasq reload command")
+        || message.contains("failed to execute dnsmasq restart command")
     {
         return DnsmasqWarning {
             code: "reload_failed".to_string(),
             message: "DNSMASQ Reload-Kommando ist fehlgeschlagen.".to_string(),
+        };
+    }
+    if message.contains("failed to write ipxe configs") {
+        return DnsmasqWarning {
+            code: "ipxe_failed".to_string(),
+            message: "iPXE Konfigurationen konnten nicht geschrieben werden.".to_string(),
         };
     }
 
@@ -1078,6 +1089,7 @@ type HostsListRowDb = (
     Option<String>,
     bool,
     Option<String>,
+    Option<String>,
 );
 
 async fn hosts_list(
@@ -1109,7 +1121,8 @@ async fn hosts_list(
                         l.name as location_name,
                         o.label as lan_outlet_label,
                         h.pxe_enabled,
-                        pi.name as pxe_image_name
+                        pi.name as pxe_image_name,
+                        h.os_type
                  from hosts h
                  left join locations l on l.id = h.location_id
                  left join lan_outlets o on o.id = h.lan_outlet_id
@@ -1138,7 +1151,8 @@ async fn hosts_list(
                         l.name as location_name,
                         o.label as lan_outlet_label,
                         h.pxe_enabled,
-                        pi.name as pxe_image_name
+                        pi.name as pxe_image_name,
+                        h.os_type
                  from hosts h
                  left join locations l on l.id = h.location_id
                  left join lan_outlets o on o.id = h.lan_outlet_id
@@ -1178,6 +1192,7 @@ async fn hosts_list(
                 lan_outlet_label,
                 pxe_enabled,
                 pxe_image_name,
+                os_type,
             )| HostRow {
                 id: id.to_string(),
                 hostname,
@@ -1187,6 +1202,7 @@ async fn hosts_list(
                 lan_outlet_label,
                 pxe_enabled,
                 pxe_image_name,
+                os_type,
             },
         )
         .collect();
@@ -1431,6 +1447,11 @@ async fn hosts_create(
     }
 
     let pxe_enabled = form.pxe_enabled.is_some();
+    let os_type = form
+        .os_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let ok_pair: Option<i32> =
         match sqlx::query_scalar("select 1 from lan_outlets where id = $1 and location_id = $2")
@@ -1506,12 +1527,13 @@ async fn hosts_create(
         subnet_id = %subnet_id,
         pxe_enabled,
         pxe_image_id,
+        os_type,
         "Attempting to insert host"
     );
 
     let res = sqlx::query(
-        "insert into hosts (hostname, ip_address, mac_address, location_id, lan_outlet_id, subnet_id, pxe_enabled, pxe_image_id)
-         values ($1, $2, $3, $4, $5, $6, $7, $8)",
+        "insert into hosts (hostname, ip_address, mac_address, location_id, lan_outlet_id, subnet_id, pxe_enabled, pxe_image_id, os_type)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(&hostname)
     .bind(ip.to_string())
@@ -1521,6 +1543,7 @@ async fn hosts_create(
     .bind(subnet_id)
     .bind(pxe_enabled)
     .bind(pxe_image_id)
+    .bind(os_type)
     .execute(&state.pool)
     .await;
 
@@ -1607,6 +1630,7 @@ type HostShowRowDb = (
     bool,
     Option<i64>,
     Option<String>,
+    Option<String>,
 );
 
 async fn host_show(
@@ -1631,7 +1655,8 @@ async fn host_show(
                 (s.name || ' (' || s.cidr::text || ')') as subnet_display,
                 h.pxe_enabled,
                 h.pxe_image_id,
-                pi.name as pxe_image_name
+                pi.name as pxe_image_name,
+                h.os_type
          from hosts h
          left join locations l on l.id = h.location_id
          left join lan_outlets o on o.id = h.lan_outlet_id
@@ -1669,6 +1694,7 @@ async fn host_show(
         pxe_enabled,
         pxe_image_id,
         pxe_image_name,
+        os_type,
     ) = row;
 
     let host = HostShow {
@@ -1685,6 +1711,7 @@ async fn host_show(
         pxe_enabled,
         pxe_image_id: pxe_image_id.map(|id| id.to_string()),
         pxe_image_name,
+        os_type,
     };
 
     let mut ctx = Context::new();
@@ -1916,6 +1943,12 @@ async fn host_update(
         .await;
     }
 
+    let os_type = form
+        .os_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     let res = sqlx::query(
         "update hosts
          set hostname = $1,
@@ -1925,8 +1958,9 @@ async fn host_update(
              lan_outlet_id = $5,
              subnet_id = $6,
              pxe_enabled = $7,
-             pxe_image_id = $8
-         where id = $9",
+             pxe_image_id = $8,
+             os_type = $9
+         where id = $10",
     )
     .bind(&hostname)
     .bind(ip.to_string())
@@ -1936,6 +1970,7 @@ async fn host_update(
     .bind(subnet_id)
     .bind(pxe_enabled)
     .bind(pxe_image_id)
+    .bind(os_type)
     .bind(id)
     .execute(&state.pool)
     .await;
@@ -2011,6 +2046,7 @@ type HostEditRowDb = (
     bool,
     Option<i64>,
     Option<String>,
+    Option<String>,
 );
 
 async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>, ()> {
@@ -2027,7 +2063,8 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
                 (s.name || ' (' || s.cidr::text || ')') as subnet_display,
                 h.pxe_enabled,
                 h.pxe_image_id,
-                pi.name as pxe_image_name
+                pi.name as pxe_image_name,
+                h.os_type
          from hosts h
          left join locations l on l.id = h.location_id
          left join lan_outlets o on o.id = h.lan_outlet_id
@@ -2056,6 +2093,7 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
             pxe_enabled,
             pxe_image_id,
             pxe_image_name,
+            os_type,
         )| HostShow {
             id: hid.to_string(),
             hostname,
@@ -2070,6 +2108,7 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
             pxe_enabled,
             pxe_image_id: pxe_image_id.map(|id| id.to_string()),
             pxe_image_name,
+            os_type,
         },
     ))
 }
@@ -2823,7 +2862,8 @@ async fn api_hosts(
                     l.name as location_name,
                     o.label as lan_outlet_label,
                     h.pxe_enabled,
-                    pi.name as pxe_image_name
+                    pi.name as pxe_image_name,
+                    h.os_type
              from hosts h
              left join locations l on l.id = h.location_id
              left join lan_outlets o on o.id = h.lan_outlet_id
@@ -2866,7 +2906,8 @@ async fn api_hosts(
                     l.name as location_name,
                     o.label as lan_outlet_label,
                     h.pxe_enabled,
-                    pi.name as pxe_image_name
+                    pi.name as pxe_image_name,
+                    h.os_type
              from hosts h
              left join locations l on l.id = h.location_id
              left join lan_outlets o on o.id = h.lan_outlet_id
@@ -2893,7 +2934,7 @@ async fn api_hosts(
     let items = rows
         .into_iter()
         .map(
-            |(id, hostname, ip, mac, _location_name, _lan_outlet_label, pxe_enabled, pxe_image_name)| {
+            |(id, hostname, ip, mac, _location_name, _lan_outlet_label, pxe_enabled, pxe_image_name, os_type)| {
                 HostApiItem {
                     id: id.to_string(),
                     hostname,
@@ -2901,6 +2942,7 @@ async fn api_hosts(
                     mac,
                     pxe_enabled,
                     pxe_image_name,
+                    os_type,
                 }
             },
         )
@@ -3565,7 +3607,8 @@ async fn render_hosts_new_error(
             "lan_outlet_id": form.lan_outlet_id.trim(),
             "subnet_id": form.subnet_id.trim(),
             "pxe_enabled": form.pxe_enabled.is_some(),
-            "pxe_image_id": form.pxe_image_id.as_deref().unwrap_or("").trim()
+            "pxe_image_id": form.pxe_image_id.as_deref().unwrap_or("").trim(),
+            "os_type": form.os_type.as_deref().unwrap_or("").trim()
         }),
     );
 
@@ -3619,6 +3662,12 @@ async fn render_host_edit_error(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string()),
         pxe_image_name: None,
+        os_type: form
+            .os_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
     };
 
     let mut ctx = Context::new();
@@ -3736,6 +3785,7 @@ mod tests {
             pxe_enabled: true,
             pxe_root_dir: "/var/lib/ipmanager/pxe".to_string(),
             tftp_root_dir: "/var/lib/tftpboot".to_string(),
+            pxe_assets_dir: "/var/lib/tftpboot/pxe-assets".to_string(),
             pxe_http_base_url: Url::parse("http://localhost:3000/pxe-assets").unwrap(),
             pxe_tftp_server: "192.0.2.1".to_string(),
             pxe_bios_bootfile: "undionly.kpxe".to_string(),
@@ -3752,6 +3802,7 @@ mod tests {
             macmon_username: None,
             macmon_password: None,
             dnsmasq_hosts_file: "/etc/dnsmasq.d/01-rust-hosts.conf".to_string(),
+            dnsmasq_conf_dir: "/etc/dnsmasq.d".to_string(),
             dnsmasq_reload_cmd: "sudo systemctl kill -s SIGHUP dnsmasq".to_string(),
             dnsmasq_interface: Some("eth0".to_string()),
             dnsmasq_bind_addr: "127.0.0.1".to_string(),

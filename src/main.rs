@@ -4,6 +4,7 @@ mod domain;
 pub mod dhcp;
 mod integrations;
 mod notifications;
+mod pxe;
 mod web;
 
 use anyhow::{Context, Result};

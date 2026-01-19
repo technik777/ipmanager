@@ -28,6 +28,7 @@ pub struct Config {
     pub pxe_enabled: bool,
     pub pxe_root_dir: String,
     pub tftp_root_dir: String,
+    pub pxe_assets_dir: String,
     pub pxe_http_base_url: Url,
     pub pxe_tftp_server: String,
     pub pxe_bios_bootfile: String,
@@ -50,6 +51,7 @@ pub struct Config {
 
     // dnsmasq
     pub dnsmasq_hosts_file: String,
+    pub dnsmasq_conf_dir: String,
     pub dnsmasq_reload_cmd: String,
     pub dnsmasq_interface: Option<String>,
     pub dnsmasq_bind_addr: String,
@@ -79,7 +81,12 @@ impl Config {
 
         let pxe_enabled = env_bool("PXE_ENABLED").unwrap_or(false);
         let pxe_root_dir = env_default("PXE_ROOT_DIR", "/var/lib/ipmanager/pxe");
-        let tftp_root_dir = env_default("TFTP_ROOT_DIR", "/var/lib/tftpboot");
+        let tftp_root_dir = env_optional("TFTP_ROOT")
+            .or_else(|| env_optional("TFTP_ROOT_DIR"))
+            .unwrap_or_else(|| "/var/lib/tftpboot".to_string());
+        let pxe_assets_dir = env_optional("PXE_ASSETS_DIR").unwrap_or_else(|| {
+            format!("{}/pxe-assets", tftp_root_dir.trim_end_matches('/'))
+        });
         let pxe_http_base_url = Url::parse(&env_default(
             "PXE_HTTP_BASE_URL",
             "http://127.0.0.1:3000/pxe-assets",
@@ -113,6 +120,9 @@ impl Config {
         // dnsmasq
         let dnsmasq_hosts_file =
             env_default("DNSMASQ_HOSTS_FILE", "/etc/dnsmasq.d/01-rust-hosts.conf");
+        let dnsmasq_conf_dir = env_optional("DNS_CONF_DIR")
+            .or_else(|| env_optional("DNSMASQ_CONF_DIR"))
+            .unwrap_or_else(|| "/etc/dnsmasq.d".to_string());
         let dnsmasq_reload_cmd =
             env_default("DNSMASQ_RELOAD_CMD", "sudo systemctl restart dnsmasq");
         let dnsmasq_interface = env_optional("DNSMASQ_INTERFACE");
@@ -138,6 +148,7 @@ impl Config {
             pxe_enabled,
             pxe_root_dir,
             tftp_root_dir,
+            pxe_assets_dir,
             pxe_http_base_url,
             pxe_tftp_server,
             pxe_bios_bootfile,
@@ -158,6 +169,7 @@ impl Config {
 
             // dnsmasq
             dnsmasq_hosts_file,
+            dnsmasq_conf_dir,
             dnsmasq_reload_cmd,
             dnsmasq_interface,
             dnsmasq_bind_addr,

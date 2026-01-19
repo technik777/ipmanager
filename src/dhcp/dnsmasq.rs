@@ -3,19 +3,18 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sqlx::{FromRow, PgPool};
-use tokio::process::Command;
-use std::collections::HashSet;
-use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command as StdCommand;
 use std::str::FromStr;
-use uuid::Uuid;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::domain::mac::MacAddr;
 use crate::integrations::macmon;
 use crate::notifications::email;
+use crate::pxe::{self, HostPxe};
 const DNSMASQ_GLOBAL_CONFIG_PATH: &str = "/etc/dnsmasq.d/00-global.conf";
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,16 +33,13 @@ pub struct DnsmasqStatus {
 
 #[derive(Debug, FromRow)]
 struct HostRow {
-    id: Uuid,
     mac_address: String,
     ip_address: String,
-    #[allow(dead_code)]
     hostname: Option<String>,
-    subnet_id: Uuid,
-    subnet_cidr: String,
+    os_type: Option<String>,
     gateway: Option<String>,
     dns_primary: Option<String>,
-    pxe_image: Option<String>,
+    pxe_enabled: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -132,26 +128,18 @@ pub async fn sync_dnsmasq_hosts(
 ) -> Result<()> {
     generate_global_config(pool, config).await?;
     check_infrastructure(Path::new(&config.tftp_root_dir)).await?;
-
-    let tftp_files = list_tftp_files(Path::new(&config.tftp_root_dir)).await;
-    let tftp_set: HashSet<String> = tftp_files.into_iter().collect();
-    let mut warnings = Vec::new();
-    let mut orphaned_count = 0usize;
+    ensure_dnsmasq_conf_dir(Path::new(&config.dnsmasq_conf_dir)).await?;
 
     let hosts: Vec<HostRow> = match sqlx::query_as(
-        "select h.id,
-                h.mac_address::text as mac_address,
+        "select h.mac_address::text as mac_address,
                 h.ip_address,
                 h.hostname,
-                h.subnet_id,
-                s.cidr::text as subnet_cidr,
+                h.os_type,
                 s.gateway::text as gateway,
-                s.dns_primary::text as dns_primary
-                ,
-                coalesce(pi.chain_url, pi.kernel_path) as pxe_image
+                s.dns_primary::text as dns_primary,
+                h.pxe_enabled
          from hosts h
          join subnets s on s.id = h.subnet_id
-         left join pxe_images pi on pi.id = h.pxe_image_id
          where s.dhcp_enabled = true
          order by s.name, h.hostname",
     )
@@ -165,130 +153,96 @@ pub async fn sync_dnsmasq_hosts(
         }
     };
 
-    let file = tokio::fs::File::create(&config.dnsmasq_hosts_file).await.with_context(|| {
-        format!(
-            "failed to open dnsmasq hosts file {}",
-            config.dnsmasq_hosts_file
-        )
-    })?;
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(b"dhcp-userclass=set:ipxe,iPXE\n")
-        .await?;
-    writer
-        .write_all(b"dhcp-boot=tag:!ipxe,ipxe.efi\n")
-        .await?;
-    writer
-        .write_all(b"dhcp-boot=tag:ipxe,boot.ipxe\n")
-        .await?;
+    clean_host_configs(Path::new(&config.dnsmasq_conf_dir)).await?;
+    let assets_rel = assets_relative_path(config);
+    let ipxe_boot = format!("{}/ipxe.efi", assets_rel);
+
+    let mut warnings = Vec::new();
+    let mut missing_assets_count = 0usize;
+    let ubuntu_assets_ok = check_ubuntu_assets(&config.pxe_assets_dir).await;
+    let ubuntu_hosts = hosts
+        .iter()
+        .filter(|host| {
+            host.os_type
+                .as_deref()
+                .map(str::trim)
+                .map(|value| value.eq_ignore_ascii_case("ubuntu"))
+                .unwrap_or(false)
+        })
+        .count();
+    if ubuntu_hosts > 0 && !ubuntu_assets_ok {
+        let warning = "Ubuntu PXE-Assets fehlen unter PXE_ASSETS_DIR".to_string();
+        warnings.push(warning.clone());
+        tracing::warn!("{}", warning);
+        missing_assets_count = ubuntu_hosts;
+    }
 
     for host in &hosts {
         let mac = MacAddr::from_str(host.mac_address.trim()).with_context(|| {
             format!("invalid mac_address in hosts table: {}", host.mac_address)
         })?;
-        let client_tag = client_tag(host.id);
-        let mut host_line = format!(
-            "dhcp-host={},set:known_host,set:{},{},",
-            mac, client_tag, host.ip_address
-        );
+        let tag = mac.to_string();
+        let mut content = String::new();
+        content.push_str(&format!("dhcp-host={},{}", tag, host.ip_address));
         if let Some(name) = host.hostname.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-            host_line.push_str(name);
-        } else if host_line.ends_with(',') {
-            host_line.pop();
+            content.push_str(&format!(",{}", name));
         }
-        host_line.push('\n');
-        writer.write_all(host_line.as_bytes()).await?;
+        content.push_str(&format!(",set:{}\n", tag));
         if let Some(name) = host.hostname.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             if name.chars().any(|c| c.is_whitespace()) {
                 tracing::warn!(
-                    host_id = %host.id,
                     hostname = %name,
                     "hostname contains whitespace; skipping address record"
                 );
             } else {
-                writer
-                    .write_all(format!("address=/{}/{}\n", name, host.ip_address).as_bytes())
-                    .await?;
+                content.push_str(&format!("address=/{}/{}\n", name, host.ip_address));
             }
         }
+        if let Some(gateway) = host.gateway.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            content.push_str(&format!(
+                "dhcp-option=tag:{},option:router,{}\n",
+                tag, gateway
+            ));
+        }
+        if let Some(dns_primary) = host.dns_primary.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            content.push_str(&format!(
+                "dhcp-option=tag:{},option:dns-server,{}\n",
+                tag, dns_primary
+            ));
+        } else if let Some(gateway) = host.gateway.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            content.push_str(&format!(
+                "dhcp-option=tag:{},option:dns-server,{}\n",
+                tag, gateway
+            ));
+        }
+        content.push_str(&format!("dhcp-boot=tag:{},{}\n", tag, ipxe_boot));
 
-        let tag = subnet_tag(&host.subnet_cidr, host.gateway.as_deref(), host.subnet_id);
-        if let Some(gateway) = host.gateway.as_deref() {
-            writer
-                .write_all(
-                    format!("dhcp-option=tag:{},option:router,{}\n", tag, gateway).as_bytes(),
-                )
-                .await?;
-        } else {
-            tracing::warn!(
-                subnet_id = %host.subnet_id,
-                subnet_cidr = %host.subnet_cidr,
-                "missing gateway for subnet; skipping dhcp-option router"
-            );
-        }
-        if let Some(dns_primary) = host.dns_primary.as_deref() {
-            writer
-                .write_all(
-                    format!(
-                        "dhcp-option=tag:{},option:dns-server,{}\n",
-                        client_tag, dns_primary
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-        } else if let Some(gateway) = host.gateway.as_deref() {
-            writer
-                .write_all(
-                    format!(
-                        "dhcp-option=tag:{},option:dns-server,{}\n",
-                        client_tag, gateway
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-        } else {
-            tracing::warn!(
-                subnet_id = %host.subnet_id,
-                subnet_cidr = %host.subnet_cidr,
-                "missing dns_primary and gateway for DNS option"
-            );
-        }
-        let pxe_image_raw = host
-            .pxe_image
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty());
-        let mut pxe_image = pxe_image_raw.unwrap_or("undionly.kpxe");
-
-        if let Some(candidate) = pxe_image_raw {
-            if valid_rel_path(candidate) && !tftp_set.contains(candidate) {
-                let warning = format!(
-                    "PXE-Image fehlt auf Platte: host_id={}, mac={}, image={}",
-                    host.id, host.mac_address, candidate
-                );
-                warnings.push(warning.clone());
-                tracing::warn!("{}", warning);
-                pxe_image = "undionly.kpxe";
-                orphaned_count += 1;
-            }
-        }
-        writer
-            .write_all(
-                format!("dhcp-boot=tag:{},{}\n", client_tag, pxe_image).as_bytes(),
-            )
-            .await?;
+        let file_path = Path::new(&config.dnsmasq_conf_dir).join(format!("host_{}.conf", tag));
+        tokio::fs::write(&file_path, content)
+            .await
+            .with_context(|| format!("failed to write dnsmasq host file {}", file_path.display()))?;
     }
-    writer.flush().await?;
+
+    let pxe_hosts: Vec<HostPxe> = hosts
+        .iter()
+        .map(|host| HostPxe {
+            mac_address: host.mac_address.clone(),
+            os_type: host.os_type.clone(),
+        })
+        .collect();
+    pxe::write_ipxe_configs(&pxe_hosts, config)
+        .await
+        .context("failed to write ipxe configs")?;
 
     let warnings_count = warnings.len();
     update_warnings(status, warnings).await;
 
     tracing::info!(
-        path = %config.dnsmasq_hosts_file,
-        "dnsmasq hosts file written"
+        path = %config.dnsmasq_conf_dir,
+        "dnsmasq host configs written"
     );
 
-    match Command::new("dnsmasq")
+    match TokioCommand::new("dnsmasq")
         .arg("--test")
         .arg("--conf-file=/etc/dnsmasq.conf")
         .output()
@@ -332,33 +286,27 @@ pub async fn sync_dnsmasq_hosts(
         }
     }
 
-    let reload_status = match Command::new("sh")
-        .arg("-c")
-        .arg(&config.dnsmasq_reload_cmd)
-        .status()
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                error = ?e,
-                command = %config.dnsmasq_reload_cmd,
-                "failed to execute dnsmasq reload command"
-            );
-            return Err(e).context("failed to execute dnsmasq reload command");
-        }
-    };
+    let reload_status = tokio::task::spawn_blocking(|| {
+        StdCommand::new("sudo")
+            .arg("systemctl")
+            .arg("restart")
+            .arg("dnsmasq")
+            .status()
+    })
+    .await
+    .context("failed to join dnsmasq restart task")?
+    .context("failed to execute dnsmasq restart command")?;
 
     if !reload_status.success() {
         tracing::error!(
             status = %reload_status,
-            command = %config.dnsmasq_reload_cmd,
+            command = "sudo systemctl restart dnsmasq",
             "dnsmasq reload command failed"
         );
         let cfg = config.clone();
         let body = format!(
             "dnsmasq reload command failed: {}\ncommand: {}",
-            reload_status, cfg.dnsmasq_reload_cmd
+            reload_status, "sudo systemctl restart dnsmasq"
         );
         tokio::spawn(async move {
             if let Err(e) = email::send_admin_alert(
@@ -384,7 +332,7 @@ pub async fn sync_dnsmasq_hosts(
     let details: JsonValue = serde_json::json!({
         "hosts_updated": hosts.len(),
         "warnings_count": warnings_count,
-        "has_orphans": orphaned_count > 0,
+        "has_orphans": missing_assets_count > 0,
     });
     if let Err(e) = sqlx::query(
         "insert into audit_logs (user_id, action, details) values ($1, $2, $3)",
@@ -398,12 +346,12 @@ pub async fn sync_dnsmasq_hosts(
         tracing::error!(error = ?e, "failed to write audit log for dnsmasq sync");
     }
 
-    if orphaned_count > 0 {
+    if missing_assets_count > 0 {
         let subject = "ipmanager: fehlende PXE-Dateien beim dnsmasq Sync";
         let body = format!(
-            "Beim dnsmasq Sync wurden {orphaned_count} Hosts mit fehlenden PXE-Dateien festgestellt.\n\
-Bitte pruefe die PXE-Images im TFTP-Root ({}).",
-            config.tftp_root_dir
+            "Beim dnsmasq Sync wurden {missing_assets_count} Hosts mit fehlenden PXE-Dateien festgestellt.\n\
+Bitte pruefe die PXE-Assets unter {}.",
+            config.pxe_assets_dir
         );
         let cfg = config.clone();
         tokio::spawn(async move {
@@ -418,38 +366,11 @@ Bitte pruefe die PXE-Images im TFTP-Root ({}).",
     }
 
     tracing::info!(
-        command = %config.dnsmasq_reload_cmd,
+        command = "sudo systemctl restart dnsmasq",
         "dnsmasq reload command succeeded"
     );
 
     Ok(())
-}
-
-fn subnet_tag(cidr: &str, gateway: Option<&str>, subnet_id: Uuid) -> String {
-    if let Some(tag) = gateway.and_then(ipv4_tag) {
-        return tag;
-    }
-
-    let cidr_ip = cidr.split('/').next().unwrap_or(cidr).trim();
-    if let Some(tag) = ipv4_tag(cidr_ip) {
-        return tag;
-    }
-
-    let fallback = subnet_id.to_string().replace('-', "_");
-    format!("net_{}", fallback)
-}
-
-fn ipv4_tag(value: &str) -> Option<String> {
-    let ip: Ipv4Addr = value.parse().ok()?;
-    let mut parts: Vec<String> = ip.octets().iter().map(|octet| octet.to_string()).collect();
-    while parts.len() > 1 && parts.last().map(String::as_str) == Some("0") {
-        parts.pop();
-    }
-    Some(format!("net_{}", parts.join("_")))
-}
-
-fn client_tag(id: Uuid) -> String {
-    format!("client_{}", id.to_string().replace('-', "_"))
 }
 
 async fn check_infrastructure(tftp_root: &Path) -> Result<()> {
@@ -482,6 +403,57 @@ async fn check_infrastructure(tftp_root: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_dnsmasq_conf_dir(conf_dir: &Path) -> Result<()> {
+    if let Err(e) = tokio::fs::create_dir_all(conf_dir).await {
+        tracing::error!(error = ?e, path = %conf_dir.display(), "failed to create dnsmasq conf dir");
+        return Err(e).context("failed to create dnsmasq conf dir");
+    }
+    Ok(())
+}
+
+async fn clean_host_configs(conf_dir: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(conf_dir)
+        .await
+        .with_context(|| format!("failed to read dnsmasq conf dir {}", conf_dir.display()))?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|v| v.to_str()) {
+            Some(v) => v,
+            None => continue,
+        };
+        if name.starts_with("host_") && name.ends_with(".conf") {
+            tokio::fs::remove_file(&path)
+                .await
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn assets_relative_path(config: &crate::config::Config) -> String {
+    let tftp_root = Path::new(&config.tftp_root_dir);
+    let assets_dir = Path::new(&config.pxe_assets_dir);
+    let rel = assets_dir
+        .strip_prefix(tftp_root)
+        .ok()
+        .and_then(|path| path.to_str())
+        .map(|v| v.trim_start_matches('/').to_string());
+    rel.filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "pxe-assets".to_string())
+}
+
+async fn check_ubuntu_assets(pxe_assets_dir: &str) -> bool {
+    let base = Path::new(pxe_assets_dir).join("ubuntu");
+    let kernel = base.join("vmlinuz");
+    let initrd = base.join("initrd.img");
+    let kernel_ok = tokio::fs::try_exists(&kernel).await.unwrap_or(false);
+    let initrd_ok = tokio::fs::try_exists(&initrd).await.unwrap_or(false);
+    kernel_ok && initrd_ok
+}
+
 pub async fn record_sync_error(status: &Mutex<DnsmasqStatus>, message: String) {
     let mut guard = status.lock().await;
     guard.warnings = vec![message];
@@ -503,60 +475,4 @@ async fn update_last_test(
 async fn update_warnings(status: &Mutex<DnsmasqStatus>, warnings: Vec<String>) {
     let mut guard = status.lock().await;
     guard.warnings = warnings;
-}
-
-async fn list_tftp_files(root_dir: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    let mut stack = vec![root_dir.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = ?e, path = %dir.display(), "failed to read tftp dir");
-                continue;
-            }
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let file_type = match entry.file_type().await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(error = ?e, path = %path.display(), "failed to read tftp entry");
-                    continue;
-                }
-            };
-
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-
-            let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("");
-            if ext != "efi" && ext != "kpxe" {
-                continue;
-            }
-
-            let relative = path
-                .strip_prefix(root_dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            files.push(relative);
-        }
-    }
-
-    files.sort();
-    files
-}
-
-fn valid_rel_path(p: &str) -> bool {
-    let path = Path::new(p);
-    !p.is_empty()
-        && !path.is_absolute()
-        && !p.starts_with('/')
-        && !path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
 }
