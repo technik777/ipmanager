@@ -19,8 +19,14 @@ pub async fn sync_new_hosts(pool: &PgPool, cfg: &Config) -> Result<usize> {
         tracing::info!("macmon config missing; skipping macmon sync");
         return Ok(0);
     };
-    let username = cfg.macmon_username.as_deref().unwrap_or("admin");
-    let password = cfg.macmon_password.as_deref().unwrap_or("admin123");
+    let Some(username) = cfg.macmon_username.as_deref() else {
+        tracing::warn!("macmon username missing; skipping macmon sync");
+        return Ok(0);
+    };
+    let Some(password) = cfg.macmon_password.as_deref() else {
+        tracing::warn!("macmon password missing; skipping macmon sync");
+        return Ok(0);
+    };
 
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "select mac_address, hostname
@@ -38,9 +44,15 @@ pub async fn sync_new_hosts(pool: &PgPool, cfg: &Config) -> Result<usize> {
         return Ok(0);
     }
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(10))
+    let skip_ssl = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host == "10.112.57.2"))
+        .unwrap_or(false);
+    let mut client_builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+    if skip_ssl {
+        client_builder = client_builder.danger_accept_invalid_certs(true);
+    }
+    let client = client_builder
         .build()
         .context("failed to build macmon http client")?;
 
