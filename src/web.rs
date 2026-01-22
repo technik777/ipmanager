@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ConnectInfo, Form, Path, Query, State},
+    extract::{ConnectInfo, Form, Multipart, Path, Query, State},
     http::{header::ACCEPT, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::{
     collections::HashSet,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     os::unix::fs::symlink,
     path::{Path as StdPath, PathBuf},
     pin::Pin,
@@ -27,6 +27,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 use tower_sessions::Session;
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -78,6 +79,9 @@ pub struct HostsApiQuery {
     pub q: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub search: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -92,8 +96,35 @@ struct BootTargetRequest {
 }
 
 #[derive(Deserialize)]
+struct NextBootActionRequest {
+    action: String,
+}
+
+#[derive(Deserialize)]
 struct PxeMenuQuery {
     mac: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BootMenuQuery {
+    mac: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BootInstallQuery {
+    mac: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BootAssetQuery {
+    path: Option<String>,
+    mac: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HostsListStateQuery {
+    search: Option<String>,
+    offset: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -107,10 +138,13 @@ pub struct HostApiItem {
     pub hostname: String,
     pub ip: String,
     pub mac: String,
+    pub location_name: Option<String>,
+    pub lan_outlet_label: Option<String>,
     pub pxe_enabled: bool,
     pub pxe_image_name: Option<String>,
     pub os_type: Option<String>,
     pub boot_target: String,
+    pub next_boot_action: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -119,6 +153,7 @@ pub struct HostsApiResponse {
     pub page: u32,
     pub per_page: u32,
     pub total: i64,
+    pub total_count: i64,
     pub total_pages: u32,
 }
 
@@ -186,7 +221,9 @@ pub struct HostUpdateForm {
 #[derive(Deserialize, Default)]
 pub struct HostsQuery {
     pub q: Option<String>,
+    pub search: Option<String>,
     pub dnsmasq: Option<String>,
+    pub msg: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -378,6 +415,10 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts/:id", get(host_show).post(host_update))
         .route("/hosts/:id/edit", get(host_edit))
         .route("/hosts/:id/delete", post(host_delete))
+        .route("/hosts/:id/reset-boot", post(post_reset_boot_action))
+        .route("/hosts/:id/set-install", post(post_set_install_action))
+        .route("/hosts/import", post(hosts_import))
+        .route("/hosts/export", get(hosts_export))
         .route("/locations", get(locations_list).post(locations_create))
         .route("/locations/new", get(locations_new))
         .route(
@@ -395,13 +436,21 @@ pub fn router(state: AppState) -> Router {
         .route("/dhcp/dnsmasq/deploy", post(dhcp_dnsmasq_deploy))
         // PXE / iPXE
         .route("/boot.ipxe", get(boot_ipxe))
+        .route("/boot/menu.ipxe", get(boot_menu_ipxe))
+        .route("/boot/install.ipxe", get(boot_install_ipxe))
+        .route("/boot/kernel", get(boot_kernel_file))
+        .route("/boot/initrd", get(boot_initrd_file))
         .route("/status", get(status_page))
+        .route("/help", get(help_page))
+        .route("/docs", get(help_page))
         // API
         .route("/api/login", post(api_login))
         .route("/api/me", get(api_me))
         .route("/api/lan-outlets", get(api_lan_outlets_by_location))
         .route("/api/find-free-ip", get(api_find_free_ip))
         .route("/api/hosts", get(api_hosts))
+        .route("/api/hosts/:id/set-install", post(api_set_host_install))
+        .route("/api/hosts/:id/next-boot", post(api_set_host_next_boot))
         .route("/api/dnsmasq/status", get(api_dnsmasq_status))
         .route("/api/v1/pxe/menu", get(pxe_menu))
         .route("/api/v1/pxe/config/unattend.xml", get(pxe_unattend))
@@ -461,6 +510,9 @@ fn ensure_lowercase_symlinks(base: &str) -> std::io::Result<()> {
             None => continue,
         };
         let lower_name = file_name.to_ascii_lowercase();
+        if lower_name == "wdsmgfw.efi" {
+            tracing::info!(file = %file_name, "wdsmgfw.efi present in boot directory");
+        }
         if lower_name == file_name {
             continue;
         }
@@ -491,10 +543,7 @@ where
 {
     type Item = Result<Bytes, std::io::Error>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let item = Pin::new(&mut self.inner).poll_next(cx);
         if let Poll::Ready(None) = item {
             if let Some(on_complete) = self.on_complete.take() {
@@ -540,8 +589,9 @@ async fn pxe_boot_file(
         "{tag}boot file download"
     );
 
-    let on_complete: Option<Box<dyn FnOnce() + Send + 'static>> =
-        if path_lower.ends_with("bcd.zenworks") {
+    let on_complete: Option<Box<dyn FnOnce() + Send + 'static>> = if path_lower
+        .ends_with("bcd.zenworks")
+    {
         let pool = state.pool.clone();
         let client_ip = addr.ip().to_string();
         Some(Box::new(move || {
@@ -621,6 +671,16 @@ async fn status_page(State(state): State<AppState>) -> Result<Html<String>, Stat
     );
 
     Ok(Html(body))
+}
+
+async fn help_page(State(state): State<AppState>, session: Session) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+
+    let mut ctx = Context::new();
+    add_auth_context(&mut ctx, &session, &state).await;
+    render(&state.templates, "help.html", ctx)
 }
 
 /* ----------------------------- Auth helpers ----------------------------- */
@@ -839,6 +899,124 @@ fn ensure_path_allowed(root: &StdPath, rel: &str) -> bool {
         Ok(real) => real.starts_with(root) && real.is_file(),
         Err(_) => false,
     }
+}
+
+fn build_hosts_redirect_url(
+    search: Option<&str>,
+    offset: Option<i64>,
+    msg: Option<&str>,
+) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    if let Some(search) = search {
+        let trimmed = search.trim();
+        if !trimmed.is_empty() {
+            serializer.append_pair("search", trimmed);
+        }
+    }
+    if let Some(offset) = offset {
+        serializer.append_pair("offset", &offset.max(0).to_string());
+    }
+    if let Some(msg) = msg {
+        let trimmed = msg.trim();
+        if !trimmed.is_empty() {
+            serializer.append_pair("msg", trimmed);
+        }
+    }
+    let query = serializer.finish();
+    if query.is_empty() {
+        "/hosts".to_string()
+    } else {
+        format!("/hosts?{}", query)
+    }
+}
+
+fn derive_location_from_hostname_ip(hostname: &str, ip: &str) -> Option<String> {
+    let host = hostname.trim();
+    if !host.is_empty() {
+        if let Some(prefix) = host.split(|c| c == '-' || c == '_').next() {
+            let prefix = prefix.trim();
+            if prefix.len() >= 2 && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Some(prefix.to_string());
+            }
+        }
+    }
+
+    if let Ok(ip) = ip.parse::<Ipv4Addr>() {
+        let octets = ip.octets();
+        return Some(format!("{}.{}", octets[0], octets[1]));
+    }
+
+    None
+}
+
+fn parse_csv_header_map(headers: &csv::StringRecord) -> Option<CsvColumnMap> {
+    let mut map = CsvColumnMap::default();
+    for (idx, name) in headers.iter().enumerate() {
+        let key = name.trim().to_lowercase();
+        match key.as_str() {
+            "hostname" | "host" | "name" => map.hostname = Some(idx),
+            "ip" | "ip_address" | "ipaddress" => map.ip = Some(idx),
+            "mac" | "mac_address" | "macaddress" => map.mac = Some(idx),
+            "location" | "standort" => map.location = Some(idx),
+            "lan_port" | "lanport" | "lan" | "lan_dose" | "lan_dose_label" => {
+                map.lan_port = Some(idx)
+            }
+            _ => {}
+        }
+    }
+    if map.hostname.is_some() && map.ip.is_some() && map.mac.is_some() {
+        Some(map)
+    } else {
+        None
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct CsvColumnMap {
+    hostname: Option<usize>,
+    ip: Option<usize>,
+    mac: Option<usize>,
+    location: Option<usize>,
+    lan_port: Option<usize>,
+}
+
+fn parse_csv_fields(record: &csv::StringRecord, map: CsvColumnMap) -> Option<ImportRow> {
+    let get = |idx: Option<usize>| idx.and_then(|i| record.get(i)).map(str::trim);
+    let hostname = get(map.hostname).unwrap_or_default();
+    let ip = get(map.ip).unwrap_or_default();
+    let mac = get(map.mac).unwrap_or_default();
+    if hostname.is_empty() || ip.is_empty() || mac.is_empty() {
+        return None;
+    }
+
+    let location = get(map.location)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let lan_port = get(map.lan_port)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+
+    Some(ImportRow {
+        hostname: hostname.to_string(),
+        ip: ip.to_string(),
+        mac: mac.to_string(),
+        location,
+        lan_port,
+    })
+}
+
+struct ImportRow {
+    hostname: String,
+    ip: String,
+    mac: String,
+    location: Option<String>,
+    lan_port: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ImportError {
+    line: u64,
+    message: String,
 }
 
 fn ipv4_to_u32(ip: Ipv4Addr) -> u32 {
@@ -1320,6 +1498,7 @@ type HostsListRowDb = (
     Option<String>,
     Option<String>,
     String,
+    Option<String>,
 );
 
 async fn hosts_list(
@@ -1333,7 +1512,7 @@ async fn hosts_list(
 
     tracing::info!("render hosts_list");
 
-    let q_raw = query.q.clone().unwrap_or_default();
+    let q_raw = query.q.as_deref().or(query.search.as_deref()).unwrap_or("");
     let q = q_raw.trim().to_string();
     let dnsmasq_status = query.dnsmasq.as_deref().map(str::to_string);
     let dnsmasq_message = match query.dnsmasq.as_deref() {
@@ -1341,104 +1520,14 @@ async fn hosts_list(
         Some("warn") => Some("Host erstellt, aber DHCP-Sync fehlgeschlagen. Details im Log."),
         _ => None,
     };
+    let flash_message = query
+        .msg
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
 
-    let rows: Vec<HostsListRowDb> = if q.is_empty() {
-        match sqlx::query_as(
-            "select h.id,
-                        h.hostname,
-                        h.ip_address,
-                        h.mac_address,
-                        l.name as location_name,
-                        o.label as lan_outlet_label,
-                        h.pxe_enabled,
-                        pi.name as pxe_image_name,
-                        h.os_type,
-                        h.boot_target
-                 from hosts h
-                 left join locations l on l.id = h.location_id
-                 left join lan_outlets o on o.id = h.lan_outlet_id
-                 left join pxe_images pi on pi.id = h.pxe_image_id
-                 order by h.hostname asc",
-        )
-        .fetch_all(&state.pool)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = ?e, "DB error in hosts_list");
-                return render_error_page(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DB Fehler beim Laden der Hosts",
-                );
-            }
-        }
-    } else {
-        let like = format!("%{}%", q);
-        match sqlx::query_as(
-            "select h.id,
-                        h.hostname,
-                        h.ip_address::text,
-                        h.mac_address,
-                        l.name as location_name,
-                        o.label as lan_outlet_label,
-                        h.pxe_enabled,
-                        pi.name as pxe_image_name,
-                        h.os_type,
-                        h.boot_target
-                 from hosts h
-                 left join locations l on l.id = h.location_id
-                 left join lan_outlets o on o.id = h.lan_outlet_id
-                 left join pxe_images pi on pi.id = h.pxe_image_id
-                 where h.hostname ilike $1
-                    or (h.ip_address::text) ilike $1
-                    or h.mac_address ilike $1
-                    or coalesce(l.name, '') ilike $1
-                    or coalesce(o.label, '') ilike $1
-                    or coalesce(pi.name, '') ilike $1
-                order by h.hostname asc",
-        )
-        .bind(like)
-        .fetch_all(&state.pool)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = ?e, "DB error in hosts_list (search)");
-                return render_error_page(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DB Fehler beim Laden der Hosts",
-                );
-            }
-        }
-    };
-
-    let hosts: Vec<HostRow> = rows
-        .into_iter()
-        .map(
-            |(
-                id,
-                hostname,
-                ip,
-                mac,
-                location_name,
-                lan_outlet_label,
-                pxe_enabled,
-                pxe_image_name,
-                os_type,
-                _boot_target,
-            )| HostRow {
-                id: id.to_string(),
-                hostname,
-                ip,
-                mac,
-                location_name,
-                lan_outlet_label,
-                pxe_enabled,
-                pxe_image_name,
-                os_type,
-            },
-        )
-        .collect();
+    let hosts: Vec<HostRow> = Vec::new();
 
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, &session, &state).await;
@@ -1446,8 +1535,395 @@ async fn hosts_list(
     ctx.insert("q", &q);
     ctx.insert("dnsmasq_message", &dnsmasq_message);
     ctx.insert("dnsmasq_status", &dnsmasq_status);
+    ctx.insert("flash_message", &flash_message);
 
     render(&state.templates, "hosts_list.html", ctx)
+}
+
+async fn hosts_import(
+    State(state): State<AppState>,
+    session: Session,
+    Query(query): Query<HostsListStateQuery>,
+    mut multipart: Multipart,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+
+    let mut data: Option<Vec<u8>> = None;
+    let mut dry_run = false;
+    let mut search = query.search.clone();
+    let mut offset = query.offset;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name() {
+            Some("file") => match field.bytes().await {
+                Ok(bytes) => {
+                    data = Some(bytes.to_vec());
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "failed to read import file");
+                    break;
+                }
+            },
+            Some("dry_run") => {
+                if let Ok(value) = field.text().await {
+                    let value = value.trim().to_lowercase();
+                    if value == "true" || value == "1" || value == "on" || value == "yes" {
+                        dry_run = true;
+                    }
+                }
+            }
+            Some("search") => {
+                if let Ok(value) = field.text().await {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        search = Some(value.to_string());
+                    }
+                }
+            }
+            Some("offset") => {
+                if let Ok(value) = field.text().await {
+                    if let Ok(parsed) = value.trim().parse::<i64>() {
+                        offset = Some(parsed);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(data) = data else {
+        let target = build_hosts_redirect_url(
+            search.as_deref(),
+            offset,
+            Some("Import fehlgeschlagen: Keine Datei gefunden"),
+        );
+        return Redirect::to(&target).into_response();
+    };
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .has_headers(true)
+        .from_reader(data.as_slice());
+
+    let headers = match rdr.headers() {
+        Ok(h) => h.clone(),
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to read csv headers");
+            let target = build_hosts_redirect_url(
+                query.search.as_deref(),
+                query.offset,
+                Some("Import fehlgeschlagen: CSV nicht lesbar"),
+            );
+            return Redirect::to(&target).into_response();
+        }
+    };
+
+    let header_map = parse_csv_header_map(&headers);
+    let map = header_map.unwrap_or(CsvColumnMap {
+        hostname: Some(0),
+        ip: Some(1),
+        mac: Some(2),
+        location: Some(3),
+        lan_port: Some(4),
+    });
+
+    let subnets: Vec<(Uuid, IpNet)> = match sqlx::query_as("select id, cidr::text from subnets")
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|(id, cidr): (Uuid, String)| {
+                cidr.parse::<IpNet>().ok().map(|net| (id, net))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to load subnets for import");
+            Vec::new()
+        }
+    };
+
+    let existing_rows: Vec<(String, String)> =
+        sqlx::query_as("select mac_address, ip_address from hosts")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default();
+    let mut existing_macs = HashSet::new();
+    let mut existing_ip_to_mac = std::collections::HashMap::new();
+    for (mac, ip) in existing_rows {
+        existing_macs.insert(mac.to_lowercase());
+        existing_ip_to_mac.insert(ip, mac.to_lowercase());
+    }
+
+    let mut created = 0;
+    let mut updated = 0;
+    let mut errors: Vec<ImportError> = Vec::new();
+    let mut seen_macs = HashSet::new();
+    let mut seen_ips = HashSet::new();
+
+    let mut records: Vec<(u64, csv::StringRecord)> = Vec::new();
+    if header_map.is_none() {
+        records.push((1, headers.clone()));
+    }
+    let mut line_no = if header_map.is_some() { 2 } else { 2 };
+    for record in rdr.records() {
+        match record {
+            Ok(rec) => records.push((line_no, rec)),
+            Err(e) => errors.push(ImportError {
+                line: line_no,
+                message: format!("CSV-Fehler: {}", e),
+            }),
+        }
+        line_no += 1;
+    }
+
+    for (line, record) in records {
+        let Some(mut row) = parse_csv_fields(&record, map) else {
+            errors.push(ImportError {
+                line,
+                message: "Pflichtfelder fehlen (hostname, ip, mac)".to_string(),
+            });
+            continue;
+        };
+
+        let ip = match row.ip.parse::<Ipv4Addr>() {
+            Ok(ip) => ip,
+            Err(_) => {
+                errors.push(ImportError {
+                    line,
+                    message: "Ungueltige IP-Adresse".to_string(),
+                });
+                continue;
+            }
+        };
+
+        let mac = match MacAddr::from_str(&row.mac) {
+            Ok(mac) => mac,
+            Err(_) => {
+                errors.push(ImportError {
+                    line,
+                    message: "Ungueltige MAC-Adresse".to_string(),
+                });
+                continue;
+            }
+        };
+
+        let subnet_id = match subnets
+            .iter()
+            .find(|(_, net)| net.contains(&IpAddr::V4(ip)))
+            .map(|(id, _)| *id)
+        {
+            Some(id) => id,
+            None => {
+                errors.push(ImportError {
+                    line,
+                    message: "Kein passendes Subnet fuer IP gefunden".to_string(),
+                });
+                continue;
+            }
+        };
+
+        let mac_key = mac.to_string().to_lowercase();
+        if !seen_macs.insert(mac_key.clone()) {
+            errors.push(ImportError {
+                line,
+                message: "Doppelte MAC in Datei".to_string(),
+            });
+            continue;
+        }
+        let ip_key = ip.to_string();
+        if !seen_ips.insert(ip_key.clone()) {
+            errors.push(ImportError {
+                line,
+                message: "Doppelte IP in Datei".to_string(),
+            });
+            continue;
+        }
+        if let Some(existing_mac) = existing_ip_to_mac.get(&ip_key) {
+            if existing_mac != &mac_key {
+                errors.push(ImportError {
+                    line,
+                    message: "IP ist bereits einem anderen Host zugeordnet".to_string(),
+                });
+                continue;
+            }
+        }
+
+        if row
+            .location
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            row.location = derive_location_from_hostname_ip(&row.hostname, &row.ip);
+        }
+
+        if existing_macs.contains(&mac_key) {
+            updated += 1;
+        } else {
+            created += 1;
+        }
+
+        if dry_run {
+            continue;
+        }
+
+        let res: Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
+            "insert into hosts (hostname, ip_address, mac_address, subnet_id, location, lan_port)
+             values ($1, $2, $3, $4, $5, $6)
+             on conflict (mac_address) do update
+             set hostname = excluded.hostname,
+                 ip_address = excluded.ip_address,
+                 subnet_id = excluded.subnet_id,
+                 location = excluded.location,
+                 lan_port = excluded.lan_port
+             returning (xmax = 0) as inserted",
+        )
+        .bind(row.hostname.trim())
+        .bind(ip.to_string())
+        .bind(mac.to_string())
+        .bind(subnet_id)
+        .bind(row.location.as_deref())
+        .bind(row.lan_port.as_deref())
+        .fetch_optional(&state.pool)
+        .await;
+
+        match res {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => {}
+            Ok(None) => errors.push(ImportError {
+                line,
+                message: "DB-Fehler beim Speichern".to_string(),
+            }),
+            Err(e) => {
+                tracing::warn!(error = ?e, mac = %mac, "failed to upsert host during import");
+                errors.push(ImportError {
+                    line,
+                    message: "DB-Fehler beim Speichern".to_string(),
+                });
+            }
+        }
+    }
+
+    let valid = created + updated;
+    if dry_run {
+        let mut ctx = Context::new();
+        add_auth_context(&mut ctx, &session, &state).await;
+        ctx.insert("valid_count", &valid);
+        ctx.insert("error_count", &errors.len());
+        ctx.insert("created_count", &created);
+        ctx.insert("updated_count", &updated);
+        ctx.insert("errors", &errors);
+        ctx.insert("search", &search);
+        ctx.insert("offset", &offset);
+        return render(&state.templates, "hosts_import_preview.html", ctx);
+    }
+
+    let msg = format!(
+        "Import abgeschlossen: {} valide Zeilen, {} Fehler. {} neu, {} Updates",
+        valid,
+        errors.len(),
+        created,
+        updated
+    );
+    let target = build_hosts_redirect_url(search.as_deref(), offset, Some(&msg));
+    Redirect::to(&target).into_response()
+}
+
+async fn hosts_export(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Response, StatusCode> {
+    if let Err(resp) = require_auth(&session).await {
+        return Ok(resp);
+    }
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Uuid,
+        bool,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "select hostname,
+                ip_address,
+                mac_address,
+                location,
+                lan_port,
+                subnet_id,
+                pxe_enabled,
+                boot_target,
+                next_boot_action
+         from hosts
+         order by hostname asc",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(true)
+        .from_writer(vec![]);
+    writer
+        .write_record([
+            "hostname",
+            "ip",
+            "mac",
+            "location",
+            "lan_port",
+            "subnet_id",
+            "pxe_enabled",
+            "boot_target",
+            "next_boot_action",
+        ])
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    for (
+        hostname,
+        ip,
+        mac,
+        location,
+        lan_port,
+        subnet_id,
+        pxe_enabled,
+        boot_target,
+        next_boot_action,
+    ) in rows
+    {
+        writer
+            .write_record([
+                hostname,
+                ip,
+                mac,
+                location.unwrap_or_default(),
+                lan_port.unwrap_or_default(),
+                subnet_id.to_string(),
+                pxe_enabled.to_string(),
+                boot_target,
+                next_boot_action.unwrap_or_default(),
+            ])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let data = writer
+        .into_inner()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut response = data.into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_static("attachment; filename=\"hosts.csv\""),
+    );
+    Ok(response)
 }
 
 async fn hosts_new(State(state): State<AppState>, session: Session) -> Response {
@@ -2239,10 +2715,18 @@ async fn host_delete(
     State(state): State<AppState>,
     session: Session,
     Path(id): Path<Uuid>,
+    Query(query): Query<HostsListStateQuery>,
 ) -> Response {
     if let Err(resp) = require_auth(&session).await {
         return resp;
     }
+
+    let mac = sqlx::query_scalar::<_, String>("select mac_address from hosts where id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
 
     let res = sqlx::query("delete from hosts where id = $1")
         .bind(id)
@@ -2255,11 +2739,62 @@ async fn host_delete(
                 StatusCode::NOT_FOUND.into_response()
             } else {
                 try_sync_dnsmasq(&state, "hosts_delete").await;
-                Redirect::to("/hosts").into_response()
+                let msg = match mac {
+                    Some(mac) => format!("Host {} erfolgreich gelöscht", mac),
+                    None => "Host erfolgreich gelöscht".to_string(),
+                };
+                let target =
+                    build_hosts_redirect_url(query.search.as_deref(), query.offset, Some(&msg));
+                Redirect::to(&target).into_response()
             }
         }
         Err(e) => {
             tracing::error!(error = %e, host_id = %id, "failed to delete host");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn post_reset_boot_action(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<HostsListStateQuery>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+
+    let mac = sqlx::query_scalar::<_, String>("select mac_address from hosts where id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+
+    let res = sqlx::query(
+        "update hosts set next_boot_action = 'local', boot_action_updated_at = now() where id = $1",
+    )
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+
+    match res {
+        Ok(r) => {
+            if r.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                let msg = match mac {
+                    Some(mac) => format!("Host {} erfolgreich zurückgesetzt", mac),
+                    None => "Boot-Aktion erfolgreich zurückgesetzt".to_string(),
+                };
+                let target =
+                    build_hosts_redirect_url(query.search.as_deref(), query.offset, Some(&msg));
+                Redirect::to(&target).into_response()
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, host_id = %id, "failed to reset next_boot_action");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3098,11 +3633,23 @@ async fn api_hosts(
 ) -> Result<Json<HostsApiResponse>, StatusCode> {
     require_auth_api(&session).await?;
 
-    let search = q.q.unwrap_or_default();
-    let search = search.trim().to_string();
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(50).clamp(1, 200);
-    let offset = (page - 1) as i64 * per_page as i64;
+    let search = q
+        .search
+        .as_deref()
+        .or(q.q.as_deref())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let limit = q
+        .limit
+        .or(q.per_page.map(|v| v as i64))
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let offset = q.offset.unwrap_or_else(|| {
+        let page = q.page.unwrap_or(1).max(1);
+        (page - 1) as i64 * limit
+    });
+    let offset = offset.max(0);
 
     let (total, rows): (i64, Vec<HostsListRowDb>) = if search.is_empty() {
         let total: i64 = sqlx::query_scalar("select count(*) from hosts")
@@ -3123,7 +3670,8 @@ async fn api_hosts(
                     h.pxe_enabled,
                     pi.name as pxe_image_name,
                     h.os_type,
-                    h.boot_target
+                    h.boot_target,
+                    h.next_boot_action
              from hosts h
              left join locations l on l.id = h.location_id
              left join lan_outlets o on o.id = h.lan_outlet_id
@@ -3131,7 +3679,7 @@ async fn api_hosts(
              order by h.hostname asc
              limit $1 offset $2",
         )
-        .bind(per_page as i64)
+        .bind(limit as i64)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
@@ -3147,7 +3695,7 @@ async fn api_hosts(
             "select count(*)
              from hosts h
              where h.hostname ilike $1
-                or h.ip_address ilike $1
+                or h.ip_address::text ilike $1
                 or h.mac_address ilike $1",
         )
         .bind(&like)
@@ -3168,19 +3716,20 @@ async fn api_hosts(
                     h.pxe_enabled,
                     pi.name as pxe_image_name,
                     h.os_type,
-                    h.boot_target
+                    h.boot_target,
+                    h.next_boot_action
              from hosts h
              left join locations l on l.id = h.location_id
              left join lan_outlets o on o.id = h.lan_outlet_id
              left join pxe_images pi on pi.id = h.pxe_image_id
              where h.hostname ilike $1
-                or h.ip_address ilike $1
+                or h.ip_address::text ilike $1
                 or h.mac_address ilike $1
              order by h.hostname asc
              limit $2 offset $3",
         )
         .bind(&like)
-        .bind(per_page as i64)
+        .bind(limit as i64)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
@@ -3200,22 +3749,26 @@ async fn api_hosts(
                 hostname,
                 ip,
                 mac,
-                _location_name,
-                _lan_outlet_label,
+                location_name,
+                lan_outlet_label,
                 pxe_enabled,
                 pxe_image_name,
                 os_type,
                 boot_target,
+                next_boot_action,
             )| {
                 HostApiItem {
                     id: id.to_string(),
                     hostname,
                     ip,
                     mac,
+                    location_name,
+                    lan_outlet_label,
                     pxe_enabled,
                     pxe_image_name,
                     os_type,
                     boot_target,
+                    next_boot_action,
                 }
             },
         )
@@ -3224,14 +3777,17 @@ async fn api_hosts(
     let total_pages = if total == 0 {
         1
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as u32
+        ((total as f64) / (limit as f64)).ceil() as u32
     };
+
+    let page = ((offset as u32) / (limit as u32)).saturating_add(1);
 
     Ok(Json(HostsApiResponse {
         items,
         page,
-        per_page,
+        per_page: limit as u32,
         total,
+        total_count: total,
         total_pages,
     }))
 }
@@ -3597,6 +4153,358 @@ async fn boot_ipxe(
         .into_response()
 }
 
+struct HostPxeData {
+    next_boot_action: Option<String>,
+    kind: Option<String>,
+    kernel_path: Option<String>,
+    initrd_path: Option<String>,
+    chain_url: Option<String>,
+    cmdline: Option<String>,
+}
+
+async fn load_host_pxe_data(
+    state: &AppState,
+    client_ip: IpAddr,
+    mac: Option<&str>,
+) -> Option<HostPxeData> {
+    let row: Option<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = if let Some(mac) = mac {
+        sqlx::query_as(
+            "select h.next_boot_action,
+                    pi.kind,
+                    pi.kernel_path,
+                    pi.initrd_path,
+                    pi.chain_url,
+                    pi.cmdline
+             from hosts h
+             left join pxe_images pi on pi.id = h.pxe_image_id
+             where lower(h.mac_address) = lower($1)
+             limit 1",
+        )
+        .bind(mac)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+    } else {
+        sqlx::query_as(
+            "select h.next_boot_action,
+                    pi.kind,
+                    pi.kernel_path,
+                    pi.initrd_path,
+                    pi.chain_url,
+                    pi.cmdline
+             from hosts h
+             left join pxe_images pi on pi.id = h.pxe_image_id
+             where h.ip_address = $1
+             limit 1",
+        )
+        .bind(client_ip.to_string())
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+    };
+
+    row.map(
+        |(next_boot_action, kind, kernel_path, initrd_path, chain_url, cmdline)| HostPxeData {
+            next_boot_action,
+            kind,
+            kernel_path,
+            initrd_path,
+            chain_url,
+            cmdline,
+        },
+    )
+}
+
+async fn reset_next_boot_action(state: &AppState, client_ip: IpAddr, mac: Option<&str>) {
+    let query = if mac.is_some() {
+        "update hosts set next_boot_action = 'local', boot_action_updated_at = now()
+         where lower(mac_address) = lower($1)"
+    } else {
+        "update hosts set next_boot_action = 'local', boot_action_updated_at = now()
+         where ip_address = $1"
+    };
+
+    let res = if let Some(mac) = mac {
+        sqlx::query(query).bind(mac).execute(&state.pool).await
+    } else {
+        sqlx::query(query)
+            .bind(client_ip.to_string())
+            .execute(&state.pool)
+            .await
+    };
+
+    if let Err(e) = res {
+        tracing::warn!(error = ?e, ip = %client_ip, mac = ?mac, "failed to reset next_boot_action");
+    }
+}
+
+async fn boot_menu_ipxe(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<BootMenuQuery>,
+) -> Response {
+    let client_ip = addr.ip();
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mac_value = if let Some(mac_raw) = query
+        .mac
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        match MacAddr::from_str(mac_raw) {
+            Ok(mac) => Some(mac.to_string()),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid mac; provide ?mac=aa:bb:cc:dd:ee:ff",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let host_data = load_host_pxe_data(&state, client_ip, mac_value.as_deref()).await;
+    let action = host_data
+        .as_ref()
+        .and_then(|data| data.next_boot_action.as_deref())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let menu_default = if action == "install" {
+        "install"
+    } else {
+        "local"
+    };
+    let base_url = state.config.base_url.as_str().trim_end_matches('/');
+    let install_url = if let Some(mac_value) = mac_value.as_deref() {
+        format!("{}/boot/install.ipxe?mac={}", base_url, mac_value)
+    } else {
+        format!("{}/boot/install.ipxe", base_url)
+    };
+
+    tracing::info!(
+        ip = %client_ip,
+        mac = ?mac_value,
+        menu_default = %menu_default,
+        "ipxe menu requested"
+    );
+
+    let script = format!(
+        "#!ipxe\n\
+set ip {client_ip}\n\
+set next_boot_action {menu_default}\n\
+\n\
+:start\n\
+menu IP-Manager Fallback (Host: ${{ip}})\n\
+item --key l local     [L] Boot from local drive (Default)\n\
+item --key i install   [I] Manual OS Installation\n\
+\n\
+choose --timeout 10000 --default ${{next_boot_action}} target && goto ${{target}}\n\
+\n\
+:local\n\
+exit\n\
+\n\
+:install\n\
+chain {install_url}\n"
+    );
+
+    (
+        axum::http::HeaderMap::from_iter(std::iter::once((
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        ))),
+        script,
+    )
+        .into_response()
+}
+
+fn build_boot_asset_url(base_url: &str, endpoint: &str, path: &str, mac: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/{}?path={}",
+        base_url.trim_end_matches('/'),
+        endpoint.trim_start_matches('/'),
+        path
+    );
+    if let Some(mac) = mac {
+        url.push_str("&mac=");
+        url.push_str(mac);
+    }
+    url
+}
+
+async fn boot_install_ipxe(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<BootInstallQuery>,
+) -> Response {
+    let client_ip = addr.ip();
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mac_value = if let Some(mac_raw) = query
+        .mac
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        match MacAddr::from_str(mac_raw) {
+            Ok(mac) => Some(mac.to_string()),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid mac; provide ?mac=aa:bb:cc:dd:ee:ff",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let host_data = load_host_pxe_data(&state, client_ip, mac_value.as_deref()).await;
+    let base_url = state.config.base_url.as_str();
+
+    let mut lines = Vec::new();
+    lines.push("#!ipxe".to_string());
+    lines.push(format!("set ip {}", client_ip));
+
+    match host_data.and_then(|data| {
+        let kind = data.kind.as_deref().unwrap_or("").trim().to_string();
+        Some((kind, data))
+    }) {
+        Some((kind, data)) if kind == "linux" => {
+            if let Some(kernel_path) = data.kernel_path.as_deref() {
+                let kernel_path = kernel_path.trim();
+                if !kernel_path.is_empty() {
+                    let kernel_url = build_boot_asset_url(
+                        base_url,
+                        "boot/kernel",
+                        kernel_path,
+                        mac_value.as_deref(),
+                    );
+                    let mut kernel_line = format!("kernel {}", kernel_url);
+                    if let Some(cmdline) = data.cmdline.as_deref() {
+                        let cmdline = cmdline.trim();
+                        if !cmdline.is_empty() {
+                            kernel_line.push(' ');
+                            kernel_line.push_str(cmdline);
+                        }
+                    }
+                    lines.push(kernel_line);
+                    if let Some(initrd_path) = data.initrd_path.as_deref() {
+                        let initrd_path = initrd_path.trim();
+                        if !initrd_path.is_empty() {
+                            let initrd_url = build_boot_asset_url(
+                                base_url,
+                                "boot/initrd",
+                                initrd_path,
+                                mac_value.as_deref(),
+                            );
+                            lines.push(format!("initrd {}", initrd_url));
+                        }
+                    }
+                    lines.push("boot".to_string());
+                } else {
+                    lines.push("exit".to_string());
+                }
+            } else {
+                lines.push("exit".to_string());
+            }
+        }
+        Some((kind, data)) if kind == "chain" => {
+            if let Some(chain_url) = data.chain_url.as_deref() {
+                let chain_url = chain_url.trim();
+                if !chain_url.is_empty() {
+                    lines.push(format!("chain {}", chain_url));
+                } else {
+                    lines.push("exit".to_string());
+                }
+            } else {
+                lines.push("exit".to_string());
+            }
+        }
+        _ => {
+            lines.push("exit".to_string());
+        }
+    }
+
+    let script = lines.join("\n") + "\n";
+    (
+        axum::http::HeaderMap::from_iter(std::iter::once((
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        ))),
+        script,
+    )
+        .into_response()
+}
+
+async fn boot_kernel_file(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<BootAssetQuery>,
+) -> Response {
+    serve_boot_asset(&state, addr.ip(), query).await
+}
+
+async fn boot_initrd_file(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<BootAssetQuery>,
+) -> Response {
+    serve_boot_asset(&state, addr.ip(), query).await
+}
+
+async fn serve_boot_asset(state: &AppState, client_ip: IpAddr, query: BootAssetQuery) -> Response {
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let Some(path) = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return (StatusCode::BAD_REQUEST, "missing path").into_response();
+    };
+
+    let root = StdPath::new(&state.config.pxe_root_dir);
+    if !ensure_path_allowed(root, path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    reset_next_boot_action(state, client_ip, query.mac.as_deref()).await;
+
+    let full_path = root.join(path);
+    let file = match tokio::fs::File::open(&full_path).await {
+        Ok(file) => file,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let stream = ReaderStream::new(file);
+    let mut response = axum::body::Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    response
+}
+
 async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuery>) -> Response {
     if !state.config.pxe_enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -3859,6 +4767,142 @@ async fn api_set_host_boot(
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to update boot_target");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn api_set_host_install(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_auth_api(&session).await {
+        return resp.into_response();
+    }
+
+    let id = match Uuid::parse_str(id.trim()) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid host id").into_response(),
+    };
+
+    let res = sqlx::query(
+        "update hosts set next_boot_action = 'install', boot_action_updated_at = now() where id = $1",
+    )
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+
+    match res {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                tracing::info!(host_id = %id, "next_boot_action set to install");
+                StatusCode::OK.into_response()
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, host_id = %id, "failed to set next_boot_action");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn post_set_install_action(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<HostsListStateQuery>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+
+    let mac = sqlx::query_scalar::<_, String>("select mac_address from hosts where id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+
+    let res = sqlx::query(
+        "update hosts set next_boot_action = 'install', boot_action_updated_at = now() where id = $1",
+    )
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+
+    match res {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                let msg = match mac {
+                    Some(mac) => format!("Installation für Host {} geplant", mac),
+                    None => "Installation geplant".to_string(),
+                };
+                let target =
+                    build_hosts_redirect_url(query.search.as_deref(), query.offset, Some(&msg));
+                Redirect::to(&target).into_response()
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, host_id = %id, "failed to set next_boot_action");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn api_set_host_next_boot(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<String>,
+    Json(req): Json<NextBootActionRequest>,
+) -> Response {
+    if let Err(resp) = require_auth_api(&session).await {
+        return resp.into_response();
+    }
+
+    let id = match Uuid::parse_str(id.trim()) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid host id").into_response(),
+    };
+
+    let action_raw = req.action.trim().to_lowercase();
+    let action = match action_raw.as_str() {
+        "" | "none" | "clear" | "local" => None,
+        "install" | "reinstall" | "reinstall_windows" | "reinstall-windows" => {
+            Some("install".to_string())
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "action must be 'install' or 'clear'",
+            )
+                .into_response()
+        }
+    };
+
+    let res = sqlx::query(
+        "update hosts set next_boot_action = $1, boot_action_updated_at = now() where id = $2",
+    )
+    .bind(action.as_deref())
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+
+    match res {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                tracing::info!(host_id = %id, action = ?action, "next_boot_action updated");
+                StatusCode::OK.into_response()
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, host_id = %id, "failed to update next_boot_action");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

@@ -11,53 +11,306 @@
   {% endif %}
 {% endif %}
 
-<p><a href="/hosts/new">Neuen Host anlegen</a></p>
+{% if flash_message %}
+  <p style="color: #1f6f2a;">{{ flash_message }}</p>
+{% endif %}
 
-<form method="get" action="/hosts" style="margin: 12px 0;">
+<div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+  <a href="/hosts/new">Neuen Host anlegen</a>
+  <form id="hosts-import-form" method="post" action="/hosts/import" enctype="multipart/form-data">
+    <input type="hidden" id="hosts-import-search" name="search" value="" />
+    <input type="hidden" id="hosts-import-offset" name="offset" value="0" />
+    <label style="display: inline-flex; gap: 6px; align-items: center;">
+      <input id="hosts-import-dry-run" type="checkbox" name="dry_run" value="true" />
+      Vorschau
+    </label>
+    <input
+      id="hosts-import-file"
+      name="file"
+      type="file"
+      accept=".csv,text/csv"
+      style="display: none;"
+      onchange="this.form.submit();"
+    />
+    <label for="hosts-import-file" style="cursor: pointer;">Import</label>
+  </form>
+  <a href="/hosts/export">Export</a>
+</div>
+
+<form id="hosts-search-form" method="get" action="/hosts" style="margin: 12px 0;">
   <label>
     Suche (Hostname, IP, MAC, Standort, LAN-Dose, PXE-Image):
-    <input name="q" value="{{ q | default(value="") }}" placeholder="z.B. Hostname, IP oder PXE-Image" />
+    <input
+      id="hosts-search-input"
+      type="search"
+      name="q"
+      value="{{ q | default(value="") }}"
+      placeholder="z.B. Hostname, IP oder PXE-Image"
+      autocomplete="off"
+    />
   </label>
   <button type="submit">Suchen</button>
   {% if q and q | length > 0 %}
-    <a href="/hosts" style="margin-left: 10px;">Zurücksetzen</a>
+    <a id="hosts-reset" href="/hosts" style="margin-left: 10px;">Zurücksetzen</a>
   {% endif %}
 </form>
 
-{% if hosts | length == 0 %}
-  <p>Keine Hosts gefunden.</p>
-{% else %}
-  <table border="1" cellpadding="6" cellspacing="0">
-    <thead>
-      <tr>
-        <th>Hostname</th>
-        <th>IP</th>
-        <th>MAC</th>
-        <th>Standort</th>
-        <th>LAN-Dose</th>
-        <th>PXE</th>
-        <th>PXE-Image</th>
-        <th>Aktionen</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for h in hosts %}
-      <tr>
-        <td><a href="/hosts/{{ h.id }}">{{ h.hostname }}</a></td>
-        <td>{{ h.ip }}</td>
-        <td>{{ h.mac }}</td>
-        <td>{{ h.location_name | default(value="") }}</td>
-        <td>{{ h.lan_outlet_label | default(value="") }}</td>
-        <td>{% if h.pxe_enabled %}ja{% else %}nein{% endif %}</td>
-        <td>{% if h.pxe_image_name %}{{ h.pxe_image_name }}{% else %}Kein PXE-Image{% endif %}</td>
-        <td>
-          <form method="post" action="/hosts/{{ h.id }}/delete" style="display:inline;" onsubmit="return confirm('Host wirklich löschen?');">
-            <button type="submit">Löschen</button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-{% endif %}
+<p id="hosts-status" style="margin: 8px 0;">Bitte mindestens 3 Zeichen eingeben.</p>
+
+<div style="margin: 12px 0;">
+  <button type="button" id="hosts-prev" disabled>Zurück</button>
+  <button type="button" id="hosts-next" disabled>Weiter</button>
+  <span id="hosts-page-info" style="margin-left: 8px;"></span>
+</div>
+
+<table id="hosts-table" border="1" cellpadding="6" cellspacing="0" style="display:none;">
+  <thead>
+    <tr>
+      <th>Hostname</th>
+      <th>IP</th>
+      <th>MAC</th>
+      <th>Standort</th>
+      <th>LAN-Dose</th>
+      <th>PXE</th>
+      <th>PXE-Image</th>
+      <th>Aktionen</th>
+    </tr>
+  </thead>
+  <tbody id="hosts-body"></tbody>
+</table>
+
+<script>
+  (function () {
+    const form = document.getElementById("hosts-search-form");
+    const input = document.getElementById("hosts-search-input");
+    const status = document.getElementById("hosts-status");
+    const table = document.getElementById("hosts-table");
+    const tbody = document.getElementById("hosts-body");
+    const prevBtn = document.getElementById("hosts-prev");
+    const nextBtn = document.getElementById("hosts-next");
+    const pageInfo = document.getElementById("hosts-page-info");
+    const importForm = document.getElementById("hosts-import-form");
+    const importSearch = document.getElementById("hosts-import-search");
+    const importOffset = document.getElementById("hosts-import-offset");
+    const limit = 50;
+    let offset = 0;
+    let total = 0;
+    let lastRequestId = 0;
+    let debounceId = null;
+    const urlParams = new URLSearchParams(window.location.search);
+    const initialSearch = urlParams.get("search") || urlParams.get("q") || "";
+    const initialOffset = parseInt(urlParams.get("offset") || "0", 10);
+    if (!input.value && initialSearch) {
+      input.value = initialSearch;
+    }
+    if (Number.isFinite(initialOffset) && initialOffset > 0) {
+      offset = initialOffset;
+    }
+
+    function setStatus(message) {
+      status.textContent = message;
+    }
+
+    function clearTable() {
+      tbody.textContent = "";
+      table.style.display = "none";
+    }
+
+    function updateControls() {
+      prevBtn.disabled = offset <= 0;
+      nextBtn.disabled = offset + limit >= total;
+      if (total > 0) {
+        const page = Math.floor(offset / limit) + 1;
+        const pages = Math.max(1, Math.ceil(total / limit));
+        pageInfo.textContent = `Seite ${page} von ${pages}`;
+      } else {
+        pageInfo.textContent = "";
+      }
+    }
+
+    function appendCell(row, text) {
+      const cell = document.createElement("td");
+      cell.textContent = text || "";
+      row.appendChild(cell);
+    }
+
+    function renderRows(items) {
+      tbody.textContent = "";
+      if (!items || items.length === 0) {
+        table.style.display = "none";
+        return;
+      }
+
+      for (const item of items) {
+        const row = document.createElement("tr");
+
+        const currentSearch = input.value.trim();
+        const actionParams = new URLSearchParams();
+        if (currentSearch.length > 0) {
+          actionParams.set("search", currentSearch);
+        }
+        actionParams.set("offset", String(offset));
+        const actionSuffix = actionParams.toString()
+          ? `?${actionParams.toString()}`
+          : "";
+
+        const hostCell = document.createElement("td");
+        const hostLink = document.createElement("a");
+        hostLink.href = `/hosts/${item.id}`;
+        hostLink.textContent = item.hostname || "";
+        hostCell.appendChild(hostLink);
+        row.appendChild(hostCell);
+
+        appendCell(row, item.ip);
+        appendCell(row, item.mac);
+        appendCell(row, item.location_name);
+        appendCell(row, item.lan_outlet_label);
+        appendCell(row, item.pxe_enabled ? "ja" : "nein");
+        appendCell(row, item.pxe_image_name || "Kein PXE-Image");
+
+        const actionsCell = document.createElement("td");
+        const installForm = document.createElement("form");
+        installForm.method = "post";
+        installForm.action = `/hosts/${item.id}/set-install${actionSuffix}`;
+        installForm.style.display = "inline";
+        const installButton = document.createElement("button");
+        installButton.type = "submit";
+        if (item.next_boot_action === "install") {
+          installButton.textContent = "Installation geplant";
+          installButton.disabled = true;
+          installButton.style.backgroundColor = "#2e7d32";
+          installButton.style.color = "#ffffff";
+        } else {
+          installButton.textContent = "Installation starten";
+        }
+        installForm.appendChild(installButton);
+        actionsCell.appendChild(installForm);
+
+        if (item.next_boot_action && item.next_boot_action !== "local") {
+          const resetForm = document.createElement("form");
+          resetForm.method = "post";
+          resetForm.action = `/hosts/${item.id}/reset-boot${actionSuffix}`;
+          resetForm.style.display = "inline";
+          resetForm.style.marginLeft = "6px";
+          const resetButton = document.createElement("button");
+          resetButton.type = "submit";
+          resetButton.textContent = "Reset";
+          resetButton.style.backgroundColor = "#c62828";
+          resetButton.style.color = "#ffffff";
+          resetForm.appendChild(resetButton);
+          actionsCell.appendChild(resetForm);
+        }
+
+        const form = document.createElement("form");
+        form.method = "post";
+        form.action = `/hosts/${item.id}/delete${actionSuffix}`;
+        form.style.display = "inline";
+        form.style.marginLeft = "6px";
+        form.onsubmit = function () {
+          return confirm("Wirklich löschen?");
+        };
+        const button = document.createElement("button");
+        button.type = "submit";
+        button.textContent = "Löschen";
+        form.appendChild(button);
+        actionsCell.appendChild(form);
+        row.appendChild(actionsCell);
+
+        tbody.appendChild(row);
+      }
+
+      table.style.display = "table";
+    }
+
+    async function loadHosts(options) {
+      const force = options && options.force;
+      const search = input.value.trim();
+
+      if (!force && search.length < 3) {
+        clearTable();
+        total = 0;
+        updateControls();
+        setStatus("Bitte mindestens 3 Zeichen eingeben.");
+        return;
+      }
+
+      setStatus("Lade...");
+      const params = new URLSearchParams();
+      params.set("limit", String(limit));
+      params.set("offset", String(offset));
+      if (search.length > 0) {
+        params.set("search", search);
+      }
+
+      const requestId = ++lastRequestId;
+      try {
+        const response = await fetch(`/api/hosts?${params.toString()}`);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        if (requestId !== lastRequestId) {
+          return;
+        }
+        total = payload.total || 0;
+        renderRows(payload.items || []);
+        updateControls();
+        if (total === 0) {
+          setStatus("Keine Hosts gefunden.");
+        } else {
+          setStatus(`Gefunden: ${total}`);
+        }
+      } catch (error) {
+        clearTable();
+        total = 0;
+        updateControls();
+        setStatus("Fehler beim Laden der Hosts.");
+        console.error(error);
+      }
+    }
+
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      offset = 0;
+      loadHosts({ force: true });
+    });
+
+    if (importForm) {
+      importForm.addEventListener("submit", function () {
+        if (importSearch) {
+          importSearch.value = input.value.trim();
+        }
+        if (importOffset) {
+          importOffset.value = String(offset);
+        }
+      });
+    }
+
+    input.addEventListener("input", function () {
+      offset = 0;
+      if (debounceId) {
+        clearTimeout(debounceId);
+      }
+      debounceId = setTimeout(function () {
+        loadHosts({ force: false });
+      }, 300);
+    });
+
+    prevBtn.addEventListener("click", function () {
+      if (offset >= limit) {
+        offset -= limit;
+        loadHosts({ force: true });
+      }
+    });
+
+    nextBtn.addEventListener("click", function () {
+      if (offset + limit < total) {
+        offset += limit;
+        loadHosts({ force: true });
+      }
+    });
+
+    loadHosts({ force: false });
+  })();
+</script>
 {% endblock content %}

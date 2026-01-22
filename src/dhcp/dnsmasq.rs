@@ -109,17 +109,12 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
     output.push_str("enable-tftp\n");
     output.push_str("tftp-root=/var/lib/tftpboot\n");
     output.push_str("dhcp-match=set:efi64,option:client-arch,7\n");
+    output.push_str("dhcp-match=set:efi64,option:client-arch,8\n");
     output.push_str("dhcp-match=set:efi64,option:client-arch,9\n");
     output.push_str("dhcp-boot=tag:!efi64,boot/x64/wdsnbp.com\n");
+    output.push_str("dhcp-boot=tag:efi64,boot/x64/wdsmgfw.efi\n");
     output.push_str("dhcp-boot=tag:boot_zenworks,boot/x64/bcd.zenworks\n");
     output.push_str("dhcp-boot=tag:boot_local,boot/x64/bcd.default\n");
-    if config.enable_ipxe {
-        output.push_str("dhcp-userclass=set:ipxe,iPXE\n");
-        output.push_str(&format!(
-            "dhcp-boot=tag:ipxe,http://{}:3000/api/v1/pxe/menu\n",
-            config.ipmanager_ip
-        ));
-    }
     output.push_str("dhcp-authoritative\n");
     output.push_str("dhcp-ignore=tag:!known\n");
 
@@ -181,9 +176,6 @@ pub async fn sync_dnsmasq_hosts(
     };
 
     clean_host_configs(Path::new(&config.dnsmasq_conf_dir)).await?;
-    let assets_rel = assets_relative_path(config);
-    let ipxe_boot = format!("{}/ipxe.efi", assets_rel);
-
     let mut warnings = Vec::new();
     let mut missing_assets_count = 0usize;
     check_windows_boot_files().await;
@@ -296,8 +288,6 @@ pub async fn sync_dnsmasq_hosts(
                 subnet_tag, gateway
             ));
         }
-        content.push_str(&format!("dhcp-boot=tag:{},{}\n", host_tag, ipxe_boot));
-
         let file_path = Path::new(&config.dnsmasq_conf_dir).join(format!("host_{}.conf", host_tag));
         tokio::fs::write(&file_path, content)
             .await
@@ -630,18 +620,6 @@ fn sanitize_dnsmasq_name(value: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-fn assets_relative_path(config: &crate::config::Config) -> String {
-    let tftp_root = Path::new(&config.tftp_root_dir);
-    let assets_dir = Path::new(&config.pxe_assets_dir);
-    let rel = assets_dir
-        .strip_prefix(tftp_root)
-        .ok()
-        .and_then(|path| path.to_str())
-        .map(|v| v.trim_start_matches('/').to_string());
-    rel.filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "pxe-assets".to_string())
-}
-
 async fn check_ubuntu_assets(pxe_assets_dir: &str) -> bool {
     let base = Path::new(pxe_assets_dir).join("ubuntu");
     let kernel = base.join("vmlinuz");
@@ -653,7 +631,7 @@ async fn check_ubuntu_assets(pxe_assets_dir: &str) -> bool {
 
 async fn check_windows_boot_files() {
     let base = Path::new("/var/lib/tftpboot/boot/x64");
-    let expected = ["bootmgfw.efi", "bcd", "boot.wim"];
+    let expected = ["wdsmgfw.efi", "bcd", "boot.wim"];
     let mut entries: Vec<String> = Vec::new();
 
     match tokio::fs::read_dir(base).await {

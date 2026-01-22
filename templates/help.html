@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}Hilfe{% endblock title %}
+{% block content %}
+<style>
+  .help-card {
+    border: 1px solid #ddd;
+    padding: 16px;
+    margin: 16px 0;
+    border-radius: 6px;
+    background: #fafafa;
+  }
+  .help-grid {
+    display: grid;
+    gap: 12px;
+  }
+  .help-flow {
+    display: grid;
+    gap: 10px;
+  }
+  .help-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px dashed #bbb;
+    background: #ffffff;
+    border-radius: 6px;
+  }
+  .help-step.plan-a {
+    border-color: #2a5db0;
+    background: #eaf1ff;
+  }
+  .help-step.plan-b {
+    border-color: #b36b00;
+    background: #fff5db;
+  }
+  .help-step.success {
+    border-color: #1f6f2a;
+    background: #e8f5e9;
+  }
+  .help-step-number {
+    min-width: 24px;
+    height: 24px;
+    border-radius: 12px;
+    background: #2f4f4f;
+    color: #ffffff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+  }
+  .help-arrow {
+    text-align: center;
+    color: #666;
+  }
+  .help-title {
+    margin: 0 0 8px 0;
+  }
+  .help-list {
+    margin: 8px 0 0 18px;
+  }
+  .faq details {
+    margin: 8px 0;
+    padding: 8px 12px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    background: #ffffff;
+  }
+  .faq summary {
+    cursor: pointer;
+  }
+</style>
+
+<h1>Hilfe: ZENworks + iPXE Workflow</h1>
+
+<div class="help-grid">
+  <div class="help-card">
+    <h2 class="help-title">Plan A: ZENworks (Standard)</h2>
+    <p>
+      Der Rechner bootet normal und kontaktiert den ZENworks-Server. Wenn dort ein aktiver Job
+      hinterlegt ist, uebernimmt ZENworks den Prozess vollstaendig.
+    </p>
+  </div>
+
+  <div class="help-card">
+    <h2 class="help-title">Prozess-Kette (Kurzuebersicht)</h2>
+    <div class="help-flow">
+      <div class="help-step plan-a">
+        <span class="help-step-number">1</span>
+        <span>PC startet PXE.</span>
+      </div>
+      <div class="help-arrow">↓</div>
+      <div class="help-step plan-a">
+        <span class="help-step-number">2</span>
+        <span>ZENworks Check (Plan A).</span>
+      </div>
+      <div class="help-arrow">↓</div>
+      <div class="help-step plan-b">
+        <span class="help-step-number">3</span>
+        <span>iPXE Fallback (Plan B) -> Pruefung <code>next_boot_action</code>.</span>
+      </div>
+      <div class="help-arrow">↓</div>
+      <div class="help-step success">
+        <span class="help-step-number">4</span>
+        <span>Boot OS oder Installation.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="help-card">
+    <h2 class="help-title">Plan B: iPXE-Fallback (ipmanager)</h2>
+    <p>
+      Wenn kein ZENworks-Job aktiv ist oder manuell eingegriffen werden muss, erscheint das
+      iPXE-Menue des ipmanager.
+    </p>
+    <ul class="help-list">
+      <li><strong>Status "local"</strong>: Der Rechner bootet normal durch.</li>
+      <li><strong>Status "install"</strong>: Das iPXE-Menue erzwingt die Installation.</li>
+    </ul>
+  </div>
+
+  <div class="help-card">
+    <h2 class="help-title">Bedienung der Host-Liste</h2>
+    <ul class="help-list">
+      <li>Suche: Nutze das Suchfeld (mindestens 3 Zeichen).</li>
+      <li>Installation starten: Setzt den Flag <code>next_boot_action</code> auf "install".</li>
+      <li>Reset: Setzt <code>next_boot_action</code> wieder auf "local".</li>
+    </ul>
+  </div>
+
+  <div class="help-card">
+    <h2 class="help-title">FAQ</h2>
+    <div class="faq">
+      <details>
+        <summary><strong>Warum erscheint das iPXE-Menue nicht?</strong></summary>
+        <p>
+          Entweder hat ZENworks (Plan A) den Bootvorgang bereits abgefangen, oder der Host ist im
+          ipmanager auf "local" gestellt.
+        </p>
+      </details>
+      <details>
+        <summary><strong>Wie breche ich eine geplante Installation ab?</strong></summary>
+        <p>Nutze den roten Reset-Button in der Host-Liste.</p>
+      </details>
+      <details>
+        <summary><strong>Der Rechner installiert in Endlosschleife?</strong></summary>
+        <p>
+          Pruefe, ob der Auto-Reset beim Kernel-Download funktioniert hat oder setze den Status
+          manuell zurueck.
+        </p>
+      </details>
+    </div>
+  </div>
+</div>
+{% endblock content %}

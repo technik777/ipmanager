@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Import Vorschau{% endblock title %}
+{% block content %}
+<h1>Import Vorschau</h1>
+
+<p>
+  Gefunden: {{ valid_count }} valide Zeilen, {{ error_count }} Fehler.
+  {{ created_count }} neue Hosts, {{ updated_count }} Updates.
+</p>
+
+<p>Jetzt importieren? Bitte Datei erneut auswaehlen und den Import ohne Vorschau starten.</p>
+
+{% if errors | length > 0 %}
+  <h2>Fehlerliste</h2>
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>Zeile</th>
+        <th>Fehler</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for err in errors %}
+      <tr>
+        <td>{{ err.line }}</td>
+        <td>{{ err.message }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{% if search or offset %}
+  <p><a href="/hosts?search={{ search | default(value="") }}&offset={{ offset | default(value=0) }}">Zurueck zur Liste</a></p>
+{% else %}
+  <p><a href="/hosts">Zurueck zur Liste</a></p>
+{% endif %}
+{% endblock content %}
