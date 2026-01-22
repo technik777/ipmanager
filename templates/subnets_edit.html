@@ -33,6 +33,12 @@
   <br /><br />
 
   <label>
+    NTP Server (optional, IPv4)<br />
+    <input name="ntp_server" placeholder="z. B. 10.70.99.33" value="{{ subnet.ntp_server | default(value="") }}" />
+  </label>
+  <br /><br />
+
+  <label>
     DHCP Pool Start (optional, IPv4)<br />
     <input name="dhcp_pool_start" placeholder="z. B. 192.168.174.50" value="{{ subnet.dhcp_pool_start | default(value="") }}" />
   </label>

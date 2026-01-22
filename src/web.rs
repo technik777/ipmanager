@@ -179,6 +179,7 @@ pub struct SubnetCreateForm {
     pub cidr: String,
     pub dns_zone: Option<String>,
     pub reverse_zone: Option<String>,
+    pub ntp_server: Option<String>,
     pub dhcp_enabled: Option<String>,
     pub pxe_enabled: Option<String>,
     pub dhcp_pool_start: Option<String>,
@@ -191,6 +192,7 @@ pub struct SubnetUpdateForm {
     pub cidr: String,
     pub dns_zone: Option<String>,
     pub reverse_zone: Option<String>,
+    pub ntp_server: Option<String>,
     pub dhcp_enabled: Option<String>,
     pub pxe_enabled: Option<String>,
     pub dhcp_pool_start: Option<String>,
@@ -204,6 +206,7 @@ struct SubnetEdit {
     cidr: String,
     dns_zone: Option<String>,
     reverse_zone: Option<String>,
+    ntp_server: Option<String>,
     dhcp_enabled: bool,
     dhcp_pool_start: Option<String>,
     dhcp_pool_end: Option<String>,
@@ -2389,6 +2392,7 @@ type SubnetsListRowDb = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
     bool,
     Option<String>,
     Option<String>,
@@ -2406,6 +2410,7 @@ async fn subnets_list(State(state): State<AppState>, session: Session) -> Respon
                 cidr::text,
                 dns_zone,
                 reverse_zone,
+                ntp_server::text as ntp_server,
                 dhcp_enabled,
                 host(dhcp_pool_start),
                 host(dhcp_pool_end),
@@ -2429,6 +2434,7 @@ async fn subnets_list(State(state): State<AppState>, session: Session) -> Respon
                 cidr,
                 dns_zone,
                 reverse_zone,
+                _ntp_server,
                 dhcp_enabled,
                 dhcp_pool_start,
                 dhcp_pool_end,
@@ -2498,6 +2504,12 @@ async fn subnets_create(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let ntp_server = form
+        .ntp_server
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let dhcp_enabled = form.dhcp_enabled.is_some();
     let pxe_enabled = form.pxe_enabled.is_some();
 
@@ -2523,13 +2535,14 @@ async fn subnets_create(
     }
 
     let res = sqlx::query(
-        "insert into subnets (name, cidr, dns_zone, reverse_zone, dhcp_enabled, pxe_enabled, dhcp_pool_start, dhcp_pool_end)
-         values ($1, $2, $3, $4, $5, $6, $7::inet, $8::inet)",
+        "insert into subnets (name, cidr, dns_zone, reverse_zone, ntp_server, dhcp_enabled, pxe_enabled, dhcp_pool_start, dhcp_pool_end)
+         values ($1, $2, $3, $4, $5::inet, $6, $7, $8::inet, $9::inet)",
     )
     .bind(&name)
     .bind(cidr.to_string())
     .bind(&dns_zone)
     .bind(&reverse_zone)
+    .bind(&ntp_server)
     .bind(dhcp_enabled)
     .bind(pxe_enabled)
     .bind(&dhcp_pool_start)
@@ -2548,7 +2561,7 @@ async fn subnets_create(
                 match code.as_str() {
                     "23505" => "Subnet existiert bereits (Name/CIDR)",
                     "23514" => "Ungültige DHCP-Pool Range: Start und Ende müssen beide gesetzt sein oder beide leer sein.",
-                    "22P02" => "Ungültige IP-Adresse in DHCP Pool Start/Ende.",
+                    "22P02" => "Ungültige IP-Adresse in Subnetzfeldern.",
                     _ => "Datenbankfehler beim Speichern",
                 }
             } else {
@@ -2575,6 +2588,7 @@ async fn subnets_edit(
                 cidr::text,
                 dns_zone,
                 reverse_zone,
+                ntp_server::text as ntp_server,
                 dhcp_enabled,
                 host(dhcp_pool_start),
                 host(dhcp_pool_end),
@@ -2597,6 +2611,7 @@ async fn subnets_edit(
         cidr,
         dns_zone,
         reverse_zone,
+        ntp_server,
         dhcp_enabled,
         dhcp_pool_start,
         dhcp_pool_end,
@@ -2612,6 +2627,7 @@ async fn subnets_edit(
         cidr,
         dns_zone,
         reverse_zone,
+        ntp_server,
         dhcp_enabled,
         dhcp_pool_start,
         dhcp_pool_end,
@@ -2661,6 +2677,12 @@ async fn subnets_update(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let ntp_server = form
+        .ntp_server
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let dhcp_enabled = form.dhcp_enabled.is_some();
     let pxe_enabled = form.pxe_enabled.is_some();
 
@@ -2693,16 +2715,18 @@ async fn subnets_update(
              cidr = $2,
              dns_zone = $3,
              reverse_zone = $4,
-             dhcp_enabled = $5,
-             pxe_enabled = $6,
-             dhcp_pool_start = $7::inet,
-             dhcp_pool_end = $8::inet
-         where id = $9",
+             ntp_server = $5::inet,
+             dhcp_enabled = $6,
+             pxe_enabled = $7,
+             dhcp_pool_start = $8::inet,
+             dhcp_pool_end = $9::inet
+         where id = $10",
     )
     .bind(&name)
     .bind(cidr.to_string())
     .bind(&dns_zone)
     .bind(&reverse_zone)
+    .bind(&ntp_server)
     .bind(dhcp_enabled)
     .bind(pxe_enabled)
     .bind(&dhcp_pool_start)
@@ -2727,7 +2751,7 @@ async fn subnets_update(
                 match code.as_str() {
                     "23505" => "Subnet existiert bereits (Name/CIDR)",
                     "23514" => "Ungültige DHCP-Pool Range: Start und Ende müssen beide gesetzt sein oder beide leer sein.",
-                    "22P02" => "Ungültige IP-Adresse in DHCP Pool Start/Ende.",
+                    "22P02" => "Ungültige IP-Adresse in Subnetzfeldern.",
                     _ => "Datenbankfehler beim Speichern",
                 }
             } else {
@@ -2757,6 +2781,11 @@ async fn render_subnets_edit_error(
             .filter(|s| !s.is_empty()),
         reverse_zone: form
             .reverse_zone
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        ntp_server: form
+            .ntp_server
             .as_deref()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),

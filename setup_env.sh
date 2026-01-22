@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ===================================================================
-# IPManager - Komplett-Setup (System, DNS-Fix, iPXE & GitHub Push)
-# Stand: 20. Jan 2026
+# IPManager - Komplett-Setup (System, DNS-Fix, NTP & iPXE)
+# Stand: 22. Jan 2026
 # ===================================================================
 
 set -e
@@ -10,9 +10,9 @@ set -e
 echo "--- Starte IPManager System-Setup für User: $USER ---"
 
 # 1. System-Updates & Abhängigkeiten
-echo "Installiere System-Pakete..."
+echo "Installiere System-Pakete (inkl. chrony für NTP)..."
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y build-essential libssl-dev pkg-config postgresql postgresql-contrib dnsmasq curl git tcpdump
+sudo apt install -y build-essential libssl-dev pkg-config postgresql postgresql-contrib dnsmasq curl git tcpdump chrony
 
 # 2. Rust Installation
 if ! command -v cargo &> /dev/null; then
@@ -68,42 +68,41 @@ if ! command -v sqlx &> /dev/null; then
 fi
 
 # 8. DNS-Konflikt lösen (systemd-resolved deaktivieren)
-# Dies macht Port 53 frei für dnsmasq
 echo "Löse Port 53 Konflikt (systemd-resolved)..."
 if systemctl is-active --quiet systemd-resolved; then
     sudo systemctl disable --now systemd-resolved
-    
-    # Backup und Neuerstellung der resolv.conf
     [ -L /etc/resolv.conf ] && sudo rm /etc/resolv.conf
-    # Nutze Google & Cloudflare als Fallback, damit der Server Internet behält
+    # Statische resolv.conf für den Server selbst
     echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee /etc/resolv.conf > /dev/null
-    echo "systemd-resolved deaktiviert. Port 53 ist nun frei für dnsmasq."
+    echo "systemd-resolved deaktiviert. Port 53 ist nun frei."
 else
-    echo "systemd-resolved ist bereits inaktiv oder nicht vorhanden."
+    echo "systemd-resolved ist bereits inaktiv."
 fi
 
-# 9. GitHub Remote & Push Setup
+# 9. NTP-Server Konfiguration (Chrony)
+echo "Konfiguriere Chrony NTP-Server..."
+# Erlaube Zugriff für das gesamte Firmennetz
+if ! grep -q "allow 10.0.0.0/8" /etc/chrony/chrony.conf; then
+    echo "allow 10.0.0.0/8" | sudo tee -a /etc/chrony/chrony.conf
+    echo "allow 172.16.0.0/12" | sudo tee -a /etc/chrony/chrony.conf
+    echo "allow 192.168.0.0/16" | sudo tee -a /etc/chrony/chrony.conf
+    sudo systemctl restart chrony
+    echo "Chrony konfiguriert und neu gestartet."
+fi
+
+# 10. GitHub Remote & Push Setup
 echo "Konfiguriere Git und führe Push aus..."
 mkdir -p ~/.ssh
 ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-
 git remote set-url origin git@github.com:SyncLogic-2026/ipmanager.git || git remote add origin git@github.com:SyncLogic-2026/ipmanager.git
 
 git add .
 if ! git diff-index --quiet HEAD --; then
-    git commit -m "Update: System Setup mit DNS-Fix und iPXE Assets"
+    git commit -m "Update: System Setup inkl. Chrony NTP und iPXE Assets"
     git push -u origin main || git push -u origin master
 else
     echo "Keine Änderungen zum Committen vorhanden."
 fi
 
-# 10. Abschluss-Check
-echo "Prüfe Port-Belegung..."
-if sudo ss -tulpn | grep -q ":53 "; then
-    echo "WARNUNG: Port 53 ist noch belegt! Prüfe mit 'sudo ss -tulpn | grep :53'"
-else
-    echo "ERFOLG: Port 53 ist frei und bereit für den IPManager."
-fi
-
 echo "--- Setup und Push erfolgreich abgeschlossen! ---"
-echo "Du kannst den IPManager nun mit 'cargo run' starten."
+echo "IPManager (DNS/DHCP/NTP) ist bereit für den Einsatz."

@@ -58,6 +58,8 @@ pub struct Config {
     pub dnsmasq_interface: Option<String>,
     pub dnsmasq_bind_addr: String,
     pub dnsmasq_port: u16,
+    pub domain_name: String,
+    pub ipmanager_ip: String,
 }
 
 impl Config {
@@ -134,6 +136,8 @@ impl Config {
         let dnsmasq_interface = env_optional("DNSMASQ_INTERFACE");
         let dnsmasq_bind_addr = env_default("DNSMASQ_BIND_ADDR", "127.0.0.1");
         let dnsmasq_port = env_u16("DNSMASQ_PORT").unwrap_or(53);
+        let domain_name = env_default("DOMAIN_NAME", "ipmanager.local");
+        let ipmanager_ip = env_default("IPMANAGER_IP", "127.0.0.1");
 
         Ok(Self {
             database_url,
@@ -182,6 +186,8 @@ impl Config {
             dnsmasq_interface,
             dnsmasq_bind_addr,
             dnsmasq_port,
+            domain_name,
+            ipmanager_ip,
         })
     }
 }
