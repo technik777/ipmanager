@@ -1,28 +1,27 @@
 #!ipxe
 
-# Variablen vom Server (MAC, Hostname, Standort)
-set mac {{ mac }}
-set host {{ hostname }}
+# Host-Infos setzen
+set hostname {{ hostname }}
+set ip {{ ip }}
 
-# Startpunkt für Rücksprung
-:start
+# Host-Infos anzeigen
+echo Booting for ${hostname} (IP: ${ip})
 
-# Menü mit 5 Sekunden Timeout
-# Nach Ablauf wird automatisch 'local' (der Default) gewählt
-menu IPManager: ${host} (${mac}) | Standort: {{ location }}
-item --key l local    [L] Windows normal starten (Default)
-item --key i install  [I] OS Installation (WDS/HTTP)
+# Das Menü
+menu IPManager - PXE Boot Menu
+item --key l local    [L] Windows direkt starten (sanboot)
 item --key s shell    [S] iPXE Shell
 choose --timeout 5000 --default local target && goto ${target}
 
 :local
-echo Booting from local disk...
-exit
-
-:install
-echo Starting Installation...
-# Hier kommt der Link zu deinem WDS oder HTTP-Installer
-chain http://10.70.99.33:3000/api/v1/pxe/install?mac=${mac} || goto start
+echo HP-Workaround: Sanbooting drive 0x80...
+# Dies ist dein funktionierender Befehl
+sanboot --no-describe --drive 0x80 ||
+# Fallback falls 0x80 mal nicht gemountet ist
+exit 0
 
 :shell
 shell
+
+:exit
+exit 0

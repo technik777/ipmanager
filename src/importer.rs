@@ -20,6 +20,7 @@ pub struct ImportError {
 pub struct ImportSummary {
     pub created: usize,
     pub updated: usize,
+    pub locations_updated: usize,
     pub errors: Vec<ImportError>,
 }
 
@@ -150,16 +151,27 @@ pub async fn import_colon_format(pool: &PgPool, input: &str) -> Result<ImportSum
         } else if let Some(id) = locations.get(location_name) {
             Some(*id)
         } else {
-            sqlx::query("insert into locations (name) values ($1) on conflict (name) do nothing")
-                .bind(location_name)
-                .execute(pool)
-                .await
-                .ok();
-            let id: Option<Uuid> = sqlx::query_scalar("select id from locations where name = $1")
-                .bind(location_name)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or_default();
+            let inserted_id: Option<Uuid> = sqlx::query_scalar(
+                "insert into locations (name) values ($1)
+                 on conflict (name) do nothing
+                 returning id",
+            )
+            .bind(location_name)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or_default();
+            if inserted_id.is_some() {
+                summary.locations_updated += 1;
+            }
+            let id: Option<Uuid> = if inserted_id.is_some() {
+                inserted_id
+            } else {
+                sqlx::query_scalar("select id from locations where name = $1")
+                    .bind(location_name)
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap_or_default()
+            };
             if let Some(id) = id {
                 locations.insert(location_name.to_string(), id);
             }
@@ -255,8 +267,8 @@ pub async fn import_colon_format(pool: &PgPool, input: &str) -> Result<ImportSum
         };
 
         let res: Option<bool> = sqlx::query_scalar(
-            "insert into hosts (hostname, ip_address, mac_address, subnet_id, location_id, lan_outlet_id, location, lan_port, is_authorized)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, true)
+            "insert into hosts (hostname, ip_address, mac_address, subnet_id, location_id, lan_outlet_id, location, lan_port, lan_dose, is_authorized)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
              on conflict (mac_address) do update
              set hostname = excluded.hostname,
                  ip_address = excluded.ip_address,
@@ -265,6 +277,7 @@ pub async fn import_colon_format(pool: &PgPool, input: &str) -> Result<ImportSum
                  lan_outlet_id = excluded.lan_outlet_id,
                  location = excluded.location,
                  lan_port = excluded.lan_port,
+                 lan_dose = excluded.lan_dose,
                  is_authorized = excluded.is_authorized
              returning (xmax = 0) as inserted",
         )
@@ -279,6 +292,7 @@ pub async fn import_colon_format(pool: &PgPool, input: &str) -> Result<ImportSum
         } else {
             Some(location_name)
         })
+        .bind(lan_port_value.as_deref())
         .bind(lan_port_value.as_deref())
         .fetch_optional(pool)
         .await

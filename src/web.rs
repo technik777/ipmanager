@@ -33,6 +33,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::dhcp::dnsmasq;
 use crate::domain::mac::MacAddr;
+use crate::importer;
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone)]
@@ -167,6 +168,20 @@ pub struct DnsmasqSyncStatusResponse {
     pub orphaned_hosts: Vec<OrphanedHost>,
     pub warnings: Vec<String>,
     pub audit_logs: Vec<AuditLogEntry>,
+}
+
+#[derive(Serialize)]
+struct ImportApiError {
+    line: usize,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ImportApiResponse {
+    created: usize,
+    updated: usize,
+    locations_updated: usize,
+    errors: Vec<ImportApiError>,
 }
 
 #[derive(Serialize)]
@@ -463,6 +478,7 @@ pub fn router(state: AppState) -> Router {
             "/download/ipxe-usb",
             get_service(ServeFile::new("assets/ipxe.usb")),
         )
+        .nest_service("/static", ServeDir::new("static"))
         .route("/status", get(status_page))
         .route("/help", get(help_page))
         .route("/docs", get(help_page))
@@ -478,6 +494,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/pxe/menu", get(pxe_menu))
         .route("/api/v1/pxe/config/unattend.xml", get(pxe_unattend))
         .route("/api/v1/pxe/set-boot", post(api_set_pxe_boot))
+        .route("/api/v1/import", post(api_import))
+        .route("/api/v1/export", get(api_export))
         .route("/api/v1/hosts/:mac/boot", put(api_set_host_boot))
         .route("/api/v1/hosts/:mac/boot", patch(api_set_host_boot))
         .route("/api/admin/shutdown", post(api_admin_shutdown));
@@ -4549,14 +4567,19 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         None => ("unknown".to_string(), None),
     };
 
-    println!(">>> PXE Request von: {}", mac_display);
+    println!(
+        "IPXE-Request von MAC: {} - Status: {}",
+        mac_display, "REQUEST"
+    );
 
-    let (action, hostname, location) = if let Some(mac) = mac_lookup.as_deref() {
+    let (action, hostname, location, ip_address) = if let Some(mac) = mac_lookup.as_deref() {
         let mac_query = mac.to_lowercase();
-        let row: Option<(Option<String>, String, Option<String>)> = sqlx::query_as(
-            "select h.next_boot_action::text,
+        let row: Option<(bool, Option<String>, String, Option<String>, String)> = sqlx::query_as(
+            "select h.is_authorized,
+                    h.next_boot_action::text,
                     h.hostname,
-                    coalesce(l.name, h.location) as location
+                    coalesce(l.name, h.location) as location,
+                    h.ip_address
              from hosts h
              left join locations l on l.id = h.location_id
              where lower(h.mac_address) = $1
@@ -4568,19 +4591,45 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         .ok()
         .flatten();
         match row {
-            Some((next_boot_action, hostname, location)) => (
-                next_boot_action.unwrap_or_else(|| "LOCAL".to_string()),
-                hostname,
-                location.unwrap_or_default(),
-            ),
+            Some((is_authorized, next_boot_action, hostname, location, ip_address)) => {
+                if !is_authorized {
+                    println!(
+                        "IPXE-Request von MAC: {} - Status: Unauthorized",
+                        mac_display
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "Host vorhanden, aber is_authorized ist FALSE. Bitte in DB auf true setzen!",
+                    )
+                        .into_response();
+                }
+                println!(
+                    "IPXE-Request von MAC: {} - Status: Authorized - Sende Menü...",
+                    mac_display
+                );
+                (
+                    next_boot_action.unwrap_or_else(|| "LOCAL".to_string()),
+                    hostname,
+                    location.unwrap_or_default(),
+                    ip_address,
+                )
+            }
             None => {
                 log_security_event(&state.pool, &mac_display, "Unknown MAC").await;
-                return (StatusCode::FORBIDDEN, "Security Alert: Unknown MAC").into_response();
+                return (
+                    StatusCode::FORBIDDEN,
+                    "MAC unbekannt - macmon wird Port sperren.",
+                )
+                    .into_response();
             }
         }
     } else {
         log_security_event(&state.pool, &mac_display, "Missing or invalid MAC").await;
-        return (StatusCode::FORBIDDEN, "Security Alert: Unknown MAC").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "MAC unbekannt - macmon wird Port sperren.",
+        )
+            .into_response();
     };
 
     let mut ctx = Context::new();
@@ -4593,6 +4642,7 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
     };
     ctx.insert("hostname", &hostname);
     ctx.insert("location", &location);
+    ctx.insert("ip", &ip_address);
     ctx.insert(
         "base_url",
         state.config.base_url.as_str().trim_end_matches('/'),
@@ -5010,6 +5060,157 @@ async fn api_set_host_next_boot(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn api_import(
+    State(state): State<AppState>,
+    session: Session,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = require_auth_api(&session).await {
+        return resp.into_response();
+    }
+
+    let input = match String::from_utf8(body.to_vec()) {
+        Ok(text) => text,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "request body must be utf-8 text").into_response()
+        }
+    };
+
+    let summary = match importer::import_colon_format(&state.pool, &input).await {
+        Ok(summary) => summary,
+        Err(e) => {
+            tracing::error!(error = ?e, "api_import failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    try_sync_dnsmasq(&state, "api_import").await;
+
+    let errors = summary
+        .errors
+        .into_iter()
+        .map(|err| ImportApiError {
+            line: err.line,
+            message: err.message,
+        })
+        .collect();
+    let response = ImportApiResponse {
+        created: summary.created,
+        updated: summary.updated,
+        locations_updated: summary.locations_updated,
+        errors,
+    };
+
+    if wants_json(&headers) {
+        return Json(response).into_response();
+    }
+
+    let mut html = String::new();
+    html.push_str("<h1>Import abgeschlossen</h1>");
+    html.push_str(&format!(
+        "<p>{} Geräte importiert, {} aktualisiert.</p>",
+        response.created, response.updated
+    ));
+    html.push_str(&format!(
+        "<p>{} Standorte aktualisiert.</p>",
+        response.locations_updated
+    ));
+    if !response.errors.is_empty() {
+        html.push_str("<h2>Fehler</h2><ul>");
+        for err in response.errors {
+            html.push_str(&format!(
+                "<li>Zeile {}: {}</li>",
+                err.line,
+                html_escape::encode_text(&err.message)
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    Html(html).into_response()
+}
+
+async fn api_export(State(state): State<AppState>, session: Session) -> Response {
+    if let Err(resp) = require_auth_api(&session).await {
+        return resp.into_response();
+    }
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = match sqlx::query_as(
+        "select h.hostname,
+                h.ip_address,
+                h.mac_address,
+                coalesce(l.name, h.location) as location,
+                h.lan_dose,
+                h.lan_port
+         from hosts h
+         left join locations l on l.id = h.location_id
+         order by h.hostname asc",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = ?e, "api_export query failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut output = String::new();
+    for (hostname, ip, mac, location, lan_dose, lan_port) in rows {
+        let (room, port) = split_room_port(lan_dose.as_deref(), lan_port.as_deref());
+        let location = location.unwrap_or_default();
+        let line = format!(
+            "{}:{}:{}:{}:{}:{}:{}\n",
+            hostname, ip, mac, "", location, room, port
+        );
+        output.push_str(&line);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    (headers, output).into_response()
+}
+
+fn split_room_port(lan_dose: Option<&str>, lan_port: Option<&str>) -> (String, String) {
+    if let Some(dose) = lan_dose.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) {
+        if let Some((room, port)) = dose.split_once('-') {
+            return (room.trim().to_string(), port.trim().to_string());
+        }
+        if let Some(port) = lan_port.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }) {
+            return (dose.to_string(), port.to_string());
+        }
+        return (dose.to_string(), String::new());
+    }
+
+    let port = lan_port.unwrap_or("").trim().to_string();
+    (String::new(), port)
 }
 
 async fn pxe_images_list(
