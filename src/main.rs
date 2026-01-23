@@ -2,6 +2,7 @@ mod config;
 mod db;
 pub mod dhcp;
 mod domain;
+mod importer;
 mod integrations;
 mod models;
 mod notifications;

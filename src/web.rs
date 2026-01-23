@@ -4551,11 +4551,15 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
 
     println!(">>> PXE Request von: {}", mac_display);
 
-    let (is_authorized, action) = if let Some(mac) = mac_lookup.as_deref() {
-        let row: Option<(bool, Option<String>)> = sqlx::query_as(
-            "select is_authorized, next_boot_action::text
-             from hosts
-             where lower(mac_address) = lower($1)
+    let (is_authorized, action, hostname, location) = if let Some(mac) = mac_lookup.as_deref() {
+        let row: Option<(bool, Option<String>, String, Option<String>)> = sqlx::query_as(
+            "select h.is_authorized,
+                    h.next_boot_action::text,
+                    h.hostname,
+                    coalesce(l.name, h.location) as location
+             from hosts h
+             left join locations l on l.id = h.location_id
+             where lower(h.mac_address) = lower($1)
              limit 1",
         )
         .bind(mac)
@@ -4564,9 +4568,11 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         .ok()
         .flatten();
         match row {
-            Some((is_authorized, next_boot_action)) => (
+            Some((is_authorized, next_boot_action, hostname, location)) => (
                 is_authorized,
                 next_boot_action.unwrap_or_else(|| "LOCAL".to_string()),
+                hostname,
+                location.unwrap_or_default(),
             ),
             None => {
                 log_security_event(&state.pool, &mac_display, "Unknown MAC").await;
@@ -4585,6 +4591,13 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
     let mut ctx = Context::new();
     ctx.insert("action", &action);
     ctx.insert("mac", &mac_display);
+    let hostname = if hostname.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        hostname
+    };
+    ctx.insert("hostname", &hostname);
+    ctx.insert("location", &location);
     ctx.insert(
         "base_url",
         state.config.base_url.as_str().trim_end_matches('/'),

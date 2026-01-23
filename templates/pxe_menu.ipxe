@@ -1,12 +1,28 @@
 #!ipxe
-echo Backend erfolgreich erreicht!
-menu IPManager - MAC: {{ mac }}
-item --key s shell    [S] iPXE Shell oeffnen
-item --key r reboot   [R] PC Neustarten
-choose --timeout 0 target && goto ${target}
+
+# Variablen vom Server (MAC, Hostname, Standort)
+set mac {{ mac }}
+set host {{ hostname }}
+
+# Startpunkt für Rücksprung
+:start
+
+# Menü mit 5 Sekunden Timeout
+# Nach Ablauf wird automatisch 'local' (der Default) gewählt
+menu IPManager: ${host} (${mac}) | Standort: {{ location }}
+item --key l local    [L] Windows normal starten (Default)
+item --key i install  [I] OS Installation (WDS/HTTP)
+item --key s shell    [S] iPXE Shell
+choose --timeout 5000 --default local target && goto ${target}
+
+:local
+echo Booting from local disk...
+exit
+
+:install
+echo Starting Installation...
+# Hier kommt der Link zu deinem WDS oder HTTP-Installer
+chain http://10.70.99.33:3000/api/v1/pxe/install?mac=${mac} || goto start
 
 :shell
 shell
-
-:reboot
-reboot
