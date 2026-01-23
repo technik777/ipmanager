@@ -4529,7 +4529,11 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let mac_raw = query.mac.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let mac_raw = query
+        .mac
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
     let (mac_display, mac_lookup) = match mac_raw {
         Some(raw) => {
             let cleaned = raw.replace('-', ":");
@@ -4541,21 +4545,38 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         None => ("unknown".to_string(), None),
     };
 
-    tracing::info!(mac = %mac_display, "pxe menu requested");
+    println!(">>> PXE Request von: {}", mac_display);
 
-    let action = if let Some(mac) = mac_lookup.as_deref() {
-        sqlx::query_scalar::<_, String>(
-            "select next_boot_action::text from hosts where lower(mac_address) = lower($1) limit 1",
+    let (is_authorized, action) = if let Some(mac) = mac_lookup.as_deref() {
+        let row: Option<(bool, Option<String>)> = sqlx::query_as(
+            "select is_authorized, next_boot_action::text
+             from hosts
+             where lower(mac_address) = lower($1)
+             limit 1",
         )
         .bind(mac)
         .fetch_optional(&state.pool)
         .await
         .ok()
-        .flatten()
-        .unwrap_or_else(|| "LOCAL".to_string())
+        .flatten();
+        match row {
+            Some((is_authorized, next_boot_action)) => (
+                is_authorized,
+                next_boot_action.unwrap_or_else(|| "LOCAL".to_string()),
+            ),
+            None => {
+                log_security_event(&state.pool, &mac_display, "Unknown MAC").await;
+                return (StatusCode::FORBIDDEN, "Security Alert: Unknown MAC").into_response();
+            }
+        }
     } else {
-        "LOCAL".to_string()
+        log_security_event(&state.pool, &mac_display, "Missing or invalid MAC").await;
+        return (StatusCode::FORBIDDEN, "Security Alert: Unknown MAC").into_response();
     };
+
+    if !is_authorized {
+        return (StatusCode::FORBIDDEN, "Access Denied: Host not authorized").into_response();
+    }
 
     let mut ctx = Context::new();
     ctx.insert("action", &action);
@@ -4566,34 +4587,40 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
     );
 
     let script = match state.templates.render("pxe_menu.ipxe", &ctx) {
-        Ok(content) => {
-            if content.starts_with("#!ipxe") {
-                content
-            } else {
-                format!("#!ipxe\n{}", content)
-            }
-        }
+        Ok(content) => content.trim_start().to_string(),
         Err(e) => {
-            tracing::error!(error = ?e, "pxe menu template render failed");
-            return (
-                axum::http::HeaderMap::from_iter(std::iter::once((
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("text/plain"),
-                ))),
-                "#!ipxe\necho Template Error\nshell",
-            )
-                .into_response();
+            println!("Rendering Error: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Template Error").into_response();
         }
     };
 
-    (
-        axum::http::HeaderMap::from_iter(std::iter::once((
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("text/plain"),
-        ))),
-        script,
-    )
-        .into_response()
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    (headers, script).into_response()
+}
+
+async fn log_security_event(pool: &PgPool, mac: &str, reason: &str) {
+    let details = serde_json::json!({
+        "mac": mac,
+        "reason": reason,
+    });
+    if let Err(e) =
+        sqlx::query("insert into audit_logs (user_id, action, details) values ($1, $2, $3)")
+            .bind(Option::<Uuid>::None)
+            .bind("security_event")
+            .bind(details)
+            .execute(pool)
+            .await
+    {
+        tracing::error!(error = ?e, mac = %mac, "failed to write security event");
+    }
 }
 
 async fn pxe_unattend(

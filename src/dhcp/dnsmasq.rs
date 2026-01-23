@@ -91,6 +91,8 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
     output.push_str(&format!("interface={interface}\n"));
     output.push_str("bind-dynamic\n");
     output.push_str("no-dhcp-interface=lo\n");
+    output.push_str("log-dhcp\n");
+    output.push_str("log-queries\n");
     let domain_name = ranges
         .iter()
         .map(|range| range.dns_zone.as_deref().map(str::trim))
@@ -245,7 +247,7 @@ pub async fn sync_dnsmasq_hosts(
             "boot_local"
         };
         content.push_str(&format!(
-            ",set:{},set:{},set:{}\n",
+            ",set:{},set:{},set:{},set:known\n",
             subnet_tag, host_tag, boot_tag
         ));
         if let Some(name) = host
