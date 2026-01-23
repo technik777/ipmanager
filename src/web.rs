@@ -4567,14 +4567,12 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         None => ("unknown".to_string(), None),
     };
 
-    println!(
-        "IPXE-Request von MAC: {} - Status: {}",
-        mac_display, "REQUEST"
-    );
+    println!("IPXE-Request von MAC: {} - Status: REQUEST", mac_display);
 
+    type PxeMenuRow = (bool, Option<String>, String, Option<String>, String);
     let (action, hostname, location, ip_address) = if let Some(mac) = mac_lookup.as_deref() {
         let mac_query = mac.to_lowercase();
-        let row: Option<(bool, Option<String>, String, Option<String>, String)> = sqlx::query_as(
+        let row: Option<PxeMenuRow> = sqlx::query_as(
             "select h.is_authorized,
                     h.next_boot_action::text,
                     h.hostname,
@@ -5137,14 +5135,15 @@ async fn api_export(State(state): State<AppState>, session: Session) -> Response
         return resp.into_response();
     }
 
-    let rows: Vec<(
+    type ExportRow = (
         String,
         String,
         String,
         Option<String>,
         Option<String>,
         Option<String>,
-    )> = match sqlx::query_as(
+    );
+    let rows: Vec<ExportRow> = match sqlx::query_as(
         "select h.hostname,
                 h.ip_address,
                 h.mac_address,
